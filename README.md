@@ -4,10 +4,13 @@ Questo progetto contiene uno script (`script.py`) che:
 - rinomina i file presenti nella stessa cartella (facoltativo);
 - crea cartelle di output per estensione dei file;
 - copia i file rinominati dentro quelle cartelle;
-- genera un file `out/index.html` con una lista di `<p>` contenenti i nomi dei file.
+- genera un file `out/index.html` con una lista di `<p>` contenenti i nomi dei file;
+- opzionalmente crea una presentazione PPTX con tutte le immagini trovate.
 
 ## Devo installare pacchetti?
-No. Lo script usa solo la libreria standard di Python, quindi non è necessario installare pacchetti esterni per eseguirlo.
+No per le funzionalità base (rinomina, copia, HTML): lo script usa solo la libreria standard di Python.
+
+Per la funzionalità opzionale di generazione PPTX serve invece il pacchetto esterno `python-pptx`.
 
 Serve solo avere Python 3 installato sul sistema.
 
@@ -58,6 +61,8 @@ Lo script creerà (di default) la cartella `out/`, con sottocartelle per estensi
 - `--no-rename` Non rinominare i file sorgente.
 - `--out OUTDIR` Specifica la cartella di output (default: `out`).
 - `--include-hidden` Includi anche i file nascosti (che iniziano con ".").
+- `--ppt` Crea un file PPTX con le immagini trovate (richiede il pacchetto opzionale `python-pptx`).
+- `--ppt-name NOME` Specifica il nome del file PPTX (default: `images.pptx`).
 
 Esempi:
 ```bash
@@ -69,6 +74,12 @@ python3 script.py --no-rename
 
 # Cambiare cartella di output:
 python3 script.py --out risultato
+
+# Creare anche una presentazione PPTX dalle immagini:
+python3 script.py --ppt
+
+# Specificare un nome personalizzato per il PPTX e la cartella di output:
+python3 script.py --ppt --ppt-name le_mie_immagini.pptx --out risultato
 ```
 
 ## Esecuzione come file eseguibile (macOS/Linux)

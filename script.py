@@ -4,16 +4,19 @@ Script eseguibile per:
 - rinominare i file presenti nella stessa cartella del programma (facoltativo: disattivabile),
 - creare delle cartelle di output (per estensione),
 - copiare i file rinominati dentro quelle cartelle,
-- generare un file HTML base con una lista di <p> contenenti i nomi dei file.
+- generare un file HTML base con una lista di <p> contenenti i nomi dei file,
+- (opzionale) creare una presentazione PPTX con tutte le immagini trovate.
 
 Uso tipico:
   python3 script.py
 
 Opzioni:
-  --dry-run         Mostra cosa verrebbe fatto senza modificare nulla.
-  --no-rename       Non rinomina i file sorgente, li lascia come sono.
-  --out OUTDIR      Cartella di output dove creare le sottocartelle e l'HTML (default: out).
-  --include-hidden  Includi anche i file nascosti (che iniziano con ".").
+  --dry-run           Mostra cosa verrebbe fatto senza modificare nulla.
+  --no-rename         Non rinomina i file sorgente, li lascia come sono.
+  --out OUTDIR        Cartella di output dove creare le sottocartelle e l'HTML (default: out).
+  --include-hidden    Includi anche i file nascosti (che iniziano con ".").
+  --ppt               Crea un file PPTX con le immagini trovate (richiede il pacchetto "python-pptx").
+  --ppt-name NOME     Nome del file PPTX (default: images.pptx). Verrà creato nella cartella di output.
 
 Nota: Per sicurezza, questo script ignora se stesso, la cartella di output e le directory.
 """
@@ -27,6 +30,56 @@ import re
 import shutil
 from pathlib import Path
 from typing import List, Tuple
+
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tif', '.tiff', '.webp'}
+
+
+def is_image_file(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTS
+
+
+def create_ppt_from_images(out_dir: Path, image_paths: List[Path], ppt_name: str, dry_run: bool) -> Path | None:
+    """Crea una presentazione PPTX con una slide per ogni immagine in image_paths.
+    Richiede il pacchetto 'python-pptx'. In modalità dry-run non crea file ma stampa cosa farebbe.
+    Ritorna il percorso del file PPTX creato, oppure None se non creato.
+    """
+    ppt_path = out_dir / ppt_name
+    if dry_run:
+        print(f"[DRY-RUN] Creerei un PPTX con {len(image_paths)} immagini in: {ppt_path}")
+        return ppt_path
+    try:
+        from pptx import Presentation
+        from pptx.util import Inches
+    except Exception as e:
+        print("Impossibile creare il PPTX: il pacchetto 'python-pptx' non è installato.")
+        print("Installa con: pip install python-pptx")
+        return None
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    prs = Presentation()
+    blank_layout = prs.slide_layouts[6]  # layout vuoto
+    slide_width = prs.slide_width
+    slide_height = prs.slide_height
+
+    for img in image_paths:
+        slide = prs.slides.add_slide(blank_layout)
+        # Inserisci l'immagine adattandola alla larghezza della slide, preservando proporzioni
+        try:
+            slide.shapes.add_picture(str(img), left=0, top=0, width=slide_width)
+        except Exception as ex:
+            # Se fallisce l'inserimento (formato non supportato), aggiungi slide con avviso testuale
+            tx_slide = slide
+            try:
+                # Aggiunge una casella di testo semplice
+                textbox = tx_slide.shapes.add_textbox(left=Inches(1), top=Inches(1), width=Inches(8), height=Inches(1.5))
+                textbox.text_frame.text = f"Immagine non supportata: {img.name}"
+            except Exception:
+                pass
+
+    prs.save(str(ppt_path))
+    print(f"PPTX creato in: {ppt_path}")
+    return ppt_path
 
 
 def slugify_filename(name: str) -> str:
@@ -152,6 +205,8 @@ def main() -> None:
     parser.add_argument('--no-rename', action='store_true', help='Non rinomina i file sorgente')
     parser.add_argument('--out', default='out', help='Cartella di output (default: out)')
     parser.add_argument('--include-hidden', action='store_true', help='Includi file nascosti (che iniziano con .)')
+    parser.add_argument('--ppt', action='store_true', help='Crea un file PPTX con le immagini trovate (richiede python-pptx)')
+    parser.add_argument('--ppt-name', default='images.pptx', help='Nome del file PPTX da creare (default: images.pptx)')
     args = parser.parse_args()
 
     base_dir = Path.cwd()
@@ -181,8 +236,10 @@ def main() -> None:
         processed_names.append(new_name)
 
     # 2) Crea cartelle e copia
+    copied_paths: List[Path] = []
     for p in renamed_paths:
-        copy_to_out(p, out_dir, dry_run=args.dry_run)
+        dest = copy_to_out(p, out_dir, dry_run=args.dry_run)
+        copied_paths.append(dest)
 
     # 3) Genera HTML
     generate_html(out_dir, processed_names)
@@ -190,6 +247,14 @@ def main() -> None:
         print(f"[DRY-RUN] Genererei HTML: {out_dir / 'index.html'}")
     else:
         print(f"HTML generato in: {out_dir / 'index.html'}")
+
+    # 4) (Opzionale) Genera PPTX da immagini
+    if args.ppt:
+        images = [p for p in copied_paths if is_image_file(p)]
+        if not images:
+            print("Nessuna immagine trovata per creare il PPTX.")
+        else:
+            create_ppt_from_images(out_dir, images, args.ppt_name, dry_run=args.dry_run)
 
 
 if __name__ == '__main__':
