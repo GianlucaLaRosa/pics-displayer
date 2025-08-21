@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
 Script eseguibile per:
-- rinominare i file presenti nella stessa cartella del programma (facoltativo: disattivabile),
-- creare delle cartelle di output (per estensione),
-- copiare i file rinominati dentro quelle cartelle,
-- generare un file HTML base con una lista di <p> contenenti i nomi dei file,
+- rinominare SOLO le immagini presenti nella stessa cartella del programma (facoltativo: disattivabile),
+- creare delle cartelle di output (per estensione) e copiare SOLO le immagini rinominate dentro quelle cartelle,
+- generare un file HTML base con una lista di <p> contenenti i nomi dei file processati (solo immagini),
 - (opzionale) creare una presentazione PPTX con tutte le immagini trovate.
 
 Uso tipico:
@@ -16,7 +15,7 @@ Opzioni:
   --out OUTDIR        Cartella di output dove creare le sottocartelle e l'HTML (default: out).
   --include-hidden    Includi anche i file nascosti (che iniziano con ".").
   --ppt               Crea un file PPTX con le immagini trovate (richiede il pacchetto "python-pptx").
-  --ppt-name NOME     Nome del file PPTX (default: images.pptx). Verrà creato nella cartella di output.
+  --ppt-name NOME     Nome del file PPTX (default: images.pptx). Verrà creato nella cartella di output /PPT.
 
 Nota: Per sicurezza, questo script ignora se stesso, la cartella di output e le directory.
 """
@@ -40,42 +39,95 @@ def is_image_file(path: Path) -> bool:
 
 def create_ppt_from_images(out_dir: Path, image_paths: List[Path], ppt_name: str, dry_run: bool) -> Path | None:
     """Crea una presentazione PPTX con una slide per ogni immagine in image_paths.
+    Aggiunge in sovraimpressione il nome del file immagine, inserisce una slide bianca tra un'immagine e l'altra,
+    e imposta una dissolvenza (fade) tra tutte le slide.
     Richiede il pacchetto 'python-pptx'. In modalità dry-run non crea file ma stampa cosa farebbe.
     Ritorna il percorso del file PPTX creato, oppure None se non creato.
     """
-    ppt_path = out_dir / ppt_name
+    ppt_dir = out_dir / 'PPT'
+    ppt_path = ppt_dir / ppt_name
     if dry_run:
-        print(f"[DRY-RUN] Creerei un PPTX con {len(image_paths)} immagini in: {ppt_path}")
+        print(f"[DRY-RUN] Creerei un PPTX con {len(image_paths)} immagini (+ slide bianche intermedie) in: {ppt_path}")
         return ppt_path
     try:
         from pptx import Presentation
-        from pptx.util import Inches
+        from pptx.util import Inches, Pt
+        from pptx.dml.color import RGBColor
+        from pptx.oxml.xmlchemy import OxmlElement
     except Exception as e:
         print("Impossibile creare il PPTX: il pacchetto 'python-pptx' non è installato.")
         print("Installa con: pip install python-pptx")
         return None
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    ppt_dir.mkdir(parents=True, exist_ok=True)
 
     prs = Presentation()
     blank_layout = prs.slide_layouts[6]  # layout vuoto
     slide_width = prs.slide_width
     slide_height = prs.slide_height
 
-    for img in image_paths:
+    def _add_fade_transition(slide) -> None:
+        """Imposta la transizione fade sulla slide tramite OXML."""
+        sld_elm = slide._element  # <p:sld>
+        # Rimuovi eventuale transizione esistente
+        for child in list(sld_elm):
+            if isinstance(child.tag, str) and child.tag.endswith('transition'):
+                sld_elm.remove(child)
+        trans = OxmlElement('p:transition')
+        fade = OxmlElement('p:fade')
+        trans.append(fade)
+        sld_elm.append(trans)
+
+    for idx, img in enumerate(image_paths):
+        # Slide con immagine
         slide = prs.slides.add_slide(blank_layout)
-        # Inserisci l'immagine adattandola alla larghezza della slide, preservando proporzioni
         try:
             slide.shapes.add_picture(str(img), left=0, top=0, width=slide_width)
-        except Exception as ex:
-            # Se fallisce l'inserimento (formato non supportato), aggiungi slide con avviso testuale
-            tx_slide = slide
+        except Exception:
+            # Se fallisce l'inserimento (formato non supportato), aggiungi messaggio
+            textbox = slide.shapes.add_textbox(left=Inches(1), top=Inches(1), width=Inches(8), height=Inches(1.5))
+            textbox.text_frame.text = f"Immagine non supportata: {img.name}"
+        # Aggiungi sovraimpressione con nome file in basso a sinistra
+        try:
+            margin = Inches(0.3)
+            tb_height = Inches(0.6)
+            tb = slide.shapes.add_textbox(left=margin, top=slide_height - tb_height - margin, width=slide_width - 2 * margin, height=tb_height)
+            # Sfondo scuro semi-trasparente per leggibilità
             try:
-                # Aggiunge una casella di testo semplice
-                textbox = tx_slide.shapes.add_textbox(left=Inches(1), top=Inches(1), width=Inches(8), height=Inches(1.5))
-                textbox.text_frame.text = f"Immagine non supportata: {img.name}"
+                fill = tb.fill
+                fill.solid()
+                fill.fore_color.rgb = RGBColor(0, 0, 0)
+                # La trasparenza potrebbe non essere supportata in tutte le versioni
+                try:
+                    fill.fore_color.transparency = 0.4  # 40% trasparente
+                except Exception:
+                    pass
             except Exception:
                 pass
+            # Rimuovi bordo
+            try:
+                tb.line.fill.background()
+            except Exception:
+                pass
+            # Testo
+            tf = tb.text_frame
+            tf.clear()
+            p = tf.paragraphs[0]
+            run = p.add_run()
+            run.text = img.name
+            font = run.font
+            font.bold = True
+            font.size = Pt(16)
+            font.color.rgb = RGBColor(255, 255, 255)
+        except Exception:
+            pass
+        # Transizione fade per la slide dell'immagine
+        _add_fade_transition(slide)
+
+        # Slide bianca tra un'immagine e l'altra (non dopo l'ultima)
+        if idx < len(image_paths) - 1:
+            blank_slide = prs.slides.add_slide(blank_layout)
+            _add_fade_transition(blank_slide)
 
     prs.save(str(ppt_path))
     print(f"PPTX creato in: {ppt_path}")
@@ -118,8 +170,9 @@ def ensure_unique(path: Path) -> Path:
 
 
 def discover_files(base_dir: Path, out_dir: Path, include_hidden: bool) -> List[Path]:
-    """Ritorna la lista dei file (non directory) nella cartella base_dir da processare.
+    """Ritorna la lista dei file immagine (non directory) nella cartella base_dir da processare.
     Esclude: script stesso, cartella out, file dentro out, directory e (di default) file nascosti.
+    Nota: da richiesta, SOLO le immagini vengono spostate/renominate.
     """
     files = []
     script_path = Path(__file__).resolve()
@@ -134,7 +187,10 @@ def discover_files(base_dir: Path, out_dir: Path, include_hidden: bool) -> List[
         if entry.resolve() == script_path:
             continue
         # Salta (di default) i file nascosti
-        if not include_hidden and entry.name.startswith('.'):
+        if not include_hidden and entry.name.startswith('.'): 
+            continue
+        # Considera solo immagini
+        if not is_image_file(entry):
             continue
         files.append(entry)
     return files
@@ -206,7 +262,7 @@ def main() -> None:
     parser.add_argument('--out', default='out', help='Cartella di output (default: out)')
     parser.add_argument('--include-hidden', action='store_true', help='Includi file nascosti (che iniziano con .)')
     parser.add_argument('--ppt', action='store_true', help='Crea un file PPTX con le immagini trovate (richiede python-pptx)')
-    parser.add_argument('--ppt-name', default='images.pptx', help='Nome del file PPTX da creare (default: images.pptx)')
+    parser.add_argument('--ppt-name', default='images.pptx', help="Nome del file PPTX da creare (default: images.pptx). Verrà creato in OUT/PPT/")
     args = parser.parse_args()
 
     base_dir = Path.cwd()
@@ -228,7 +284,7 @@ def main() -> None:
     renamed_paths: List[Path] = []
     for f in files:
         current = f
-        if not args.no-rename:
+        if not args.no_rename:
             current, new_name = rename_file(f, dry_run=args.dry_run)
         else:
             new_name = f.name
