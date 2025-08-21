@@ -79,15 +79,83 @@ def create_ppt_from_images(out_dir: Path, image_paths: List[Path], ppt_name: str
         sld_elm.append(trans)
 
     for idx, img in enumerate(image_paths):
-        # Slide con immagine
+        # Slide con immagine su sfondo sfumato
         slide = prs.slides.add_slide(blank_layout)
+
+        # Sfondo: imposta gradiente come background della slide (più robusto e sempre sotto ai contenuti)
         try:
-            slide.shapes.add_picture(str(img), left=0, top=0, width=slide_width)
+            sld = slide._element  # <p:sld>
+            cSld = sld.get_or_add_cSld()
+            # Rimuovi eventuale <p:bg> precedente per evitare stati anomali
+            for child in list(cSld):
+                if isinstance(child.tag, str) and child.tag.endswith('bg'):
+                    cSld.remove(child)
+            bg = OxmlElement('p:bg')
+            bgPr = OxmlElement('p:bgPr')
+            # Crea gradiente lineare 315°: grigio chiaro -> grigio scuro
+            gradFill = OxmlElement('a:gradFill')
+            gsLst = OxmlElement('a:gsLst')
+            gs1 = OxmlElement('a:gs')
+            gs1.set('pos', '0')
+            srgb1 = OxmlElement('a:srgbClr')
+            srgb1.set('val', 'D9D9D9')  # grigio chiaro
+            gs1.append(srgb1)
+            gs2 = OxmlElement('a:gs')
+            gs2.set('pos', '100000')
+            srgb2 = OxmlElement('a:srgbClr')
+            srgb2.set('val', '4D4D4D')  # grigio scuro
+            gs2.append(srgb2)
+            gsLst.append(gs1)
+            gsLst.append(gs2)
+            gradFill.append(gsLst)
+            lin = OxmlElement('a:lin')
+            lin.set('ang', str(315 * 60000))  # 315° = dall'alto destra verso basso sinistra
+            lin.set('scaled', '1')
+            gradFill.append(lin)
+            bgPr.append(gradFill)
+            bg.append(bgPr)
+            cSld.append(bg)
+        except Exception:
+            # Fallback: background solido grigio chiaro se il gradiente non è disponibile
+            try:
+                sld = slide._element
+                cSld = sld.get_or_add_cSld()
+                for child in list(cSld):
+                    if isinstance(child.tag, str) and child.tag.endswith('bg'):
+                        cSld.remove(child)
+                bg = OxmlElement('p:bg')
+                bgPr = OxmlElement('p:bgPr')
+                solidFill = OxmlElement('a:solidFill')
+                srgb = OxmlElement('a:srgbClr')
+                srgb.set('val', 'D9D9D9')
+                solidFill.append(srgb)
+                bgPr.append(solidFill)
+                bg.append(bgPr)
+                cSld.append(bg)
+            except Exception:
+                pass
+
+        # Immagine: adattata per stare tutta nella slide, centrata
+        try:
+            pic = slide.shapes.add_picture(str(img), left=0, top=0)
+            # Calcola scala per "contain"
+            try:
+                img_w, img_h = pic.width, pic.height  # EMU
+                scale = min(slide_width / img_w, slide_height / img_h) if img_w and img_h else 1
+                new_w = int(img_w * scale)
+                new_h = int(img_h * scale)
+                pic.width = new_w
+                pic.height = new_h
+                pic.left = int((slide_width - new_w) / 2)
+                pic.top = int((slide_height - new_h) / 2)
+            except Exception:
+                pass
         except Exception:
             # Se fallisce l'inserimento (formato non supportato), aggiungi messaggio
             textbox = slide.shapes.add_textbox(left=Inches(1), top=Inches(1), width=Inches(8), height=Inches(1.5))
             textbox.text_frame.text = f"Immagine non supportata: {img.name}"
-        # Aggiungi sovraimpressione con nome file in basso a sinistra
+        
+        # Aggiungi sovraimpressione con nome file in basso a sinistra (sopra all'immagine)
         try:
             margin = Inches(0.3)
             tb_height = Inches(0.6)
