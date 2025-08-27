@@ -1,385 +1,650 @@
 #!/usr/bin/env python3
-"""
-Script eseguibile per:
-- rinominare SOLO le immagini presenti nella stessa cartella del programma (facoltativo: disattivabile),
-- creare delle cartelle di output (per estensione) e copiare SOLO le immagini rinominate dentro quelle cartelle,
-- generare un file HTML base con una lista di <p> contenenti i nomi dei file processati (solo immagini),
-- (opzionale) creare una presentazione PPTX con tutte le immagini trovate.
-
-Uso tipico:
-  python3 script.py
-
-Opzioni:
-  --dry-run           Mostra cosa verrebbe fatto senza modificare nulla.
-  --no-rename         Non rinomina i file sorgente, li lascia come sono.
-  --out OUTDIR        Cartella di output dove creare le sottocartelle e l'HTML (default: out).
-  --include-hidden    Includi anche i file nascosti (che iniziano con ".").
-  --ppt               Crea un file PPTX con le immagini trovate (richiede il pacchetto "python-pptx").
-  --ppt-name NOME     Nome del file PPTX (default: images.pptx). Verrà creato nella cartella di output /PPT.
-
-Nota: Per sicurezza, questo script ignora se stesso, la cartella di output e le directory.
-"""
-
-from __future__ import annotations
-
-import argparse
-import html
-import os
-import re
-import shutil
+import datetime
+import csv
+import sys
+import random
 from pathlib import Path
-from typing import List, Tuple
-
-IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tif', '.tiff', '.webp'}
 
 
-def is_image_file(path: Path) -> bool:
-    return path.suffix.lower() in IMAGE_EXTS
+def _sanitize_name(name: str) -> str:
+    invalid = '<>:"/\\|?*'
+    sanitized = ''.join('_' if c in invalid else c for c in name)
+    sanitized = sanitized.strip().rstrip(' .')
+    while '  ' in sanitized:
+        sanitized = sanitized.replace('  ', ' ')
+    return sanitized or 'Concorso'
 
 
-def create_ppt_from_images(out_dir: Path, image_paths: List[Path], ppt_name: str, dry_run: bool) -> Path | None:
-    """Crea una presentazione PPTX con una slide per ogni immagine in image_paths.
-    Aggiunge in sovraimpressione il nome del file immagine, inserisce una slide bianca tra un'immagine e l'altra,
-    e imposta una dissolvenza (fade) tra tutte le slide.
-    Richiede il pacchetto 'python-pptx'. In modalità dry-run non crea file ma stampa cosa farebbe.
-    Ritorna il percorso del file PPTX creato, oppure None se non creato.
-    """
-    ppt_dir = out_dir / 'PPT'
-    ppt_path = ppt_dir / ppt_name
-    if dry_run:
-        print(f"[DRY-RUN] Creerei un PPTX con {len(image_paths)} immagini (+ slide bianche intermedie) in: {ppt_path}")
-        return ppt_path
+def _exit_requested(s: str) -> bool:
+    return s.strip().lower() in {"q", "quit", "esci", "exit", "stop"}
+
+
+def _input_or_exit(prompt: str) -> str:
     try:
-        from pptx import Presentation
-        from pptx.util import Inches, Pt
-        from pptx.dml.color import RGBColor
-        from pptx.oxml.xmlchemy import OxmlElement
-    except Exception as e:
-        print("Impossibile creare il PPTX: il pacchetto 'python-pptx' non è installato.")
-        print("Installa con: pip install python-pptx")
-        return None
-
-    ppt_dir.mkdir(parents=True, exist_ok=True)
-
-    prs = Presentation()
-    blank_layout = prs.slide_layouts[6]  # layout vuoto
-    slide_width = prs.slide_width
-    slide_height = prs.slide_height
-
-    def _add_fade_transition(slide) -> None:
-        """Imposta la transizione fade sulla slide tramite OXML."""
-        sld_elm = slide._element  # <p:sld>
-        # Rimuovi eventuale transizione esistente
-        for child in list(sld_elm):
-            if isinstance(child.tag, str) and child.tag.endswith('transition'):
-                sld_elm.remove(child)
-        trans = OxmlElement('p:transition')
-        fade = OxmlElement('p:fade')
-        trans.append(fade)
-        sld_elm.append(trans)
-
-    for idx, img in enumerate(image_paths):
-        # Slide con immagine su sfondo sfumato
-        slide = prs.slides.add_slide(blank_layout)
-
-        # Sfondo: imposta gradiente come background della slide (più robusto e sempre sotto ai contenuti)
-        try:
-            sld = slide._element  # <p:sld>
-            cSld = sld.get_or_add_cSld()
-            # Rimuovi eventuale <p:bg> precedente per evitare stati anomali
-            for child in list(cSld):
-                if isinstance(child.tag, str) and child.tag.endswith('bg'):
-                    cSld.remove(child)
-            bg = OxmlElement('p:bg')
-            bgPr = OxmlElement('p:bgPr')
-            # Crea gradiente lineare 315°: grigio chiaro -> grigio scuro
-            gradFill = OxmlElement('a:gradFill')
-            gsLst = OxmlElement('a:gsLst')
-            gs1 = OxmlElement('a:gs')
-            gs1.set('pos', '0')
-            srgb1 = OxmlElement('a:srgbClr')
-            srgb1.set('val', 'D9D9D9')  # grigio chiaro
-            gs1.append(srgb1)
-            gs2 = OxmlElement('a:gs')
-            gs2.set('pos', '100000')
-            srgb2 = OxmlElement('a:srgbClr')
-            srgb2.set('val', '4D4D4D')  # grigio scuro
-            gs2.append(srgb2)
-            gsLst.append(gs1)
-            gsLst.append(gs2)
-            gradFill.append(gsLst)
-            lin = OxmlElement('a:lin')
-            lin.set('ang', str(315 * 60000))  # 315° = dall'alto destra verso basso sinistra
-            lin.set('scaled', '1')
-            gradFill.append(lin)
-            bgPr.append(gradFill)
-            bg.append(bgPr)
-            cSld.append(bg)
-        except Exception:
-            # Fallback: background solido grigio chiaro se il gradiente non è disponibile
-            try:
-                sld = slide._element
-                cSld = sld.get_or_add_cSld()
-                for child in list(cSld):
-                    if isinstance(child.tag, str) and child.tag.endswith('bg'):
-                        cSld.remove(child)
-                bg = OxmlElement('p:bg')
-                bgPr = OxmlElement('p:bgPr')
-                solidFill = OxmlElement('a:solidFill')
-                srgb = OxmlElement('a:srgbClr')
-                srgb.set('val', 'D9D9D9')
-                solidFill.append(srgb)
-                bgPr.append(solidFill)
-                bg.append(bgPr)
-                cSld.append(bg)
-            except Exception:
-                pass
-
-        # Immagine: adattata per stare tutta nella slide, centrata
-        try:
-            pic = slide.shapes.add_picture(str(img), left=0, top=0)
-            # Calcola scala per "contain"
-            try:
-                img_w, img_h = pic.width, pic.height  # EMU
-                scale = min(slide_width / img_w, slide_height / img_h) if img_w and img_h else 1
-                new_w = int(img_w * scale)
-                new_h = int(img_h * scale)
-                pic.width = new_w
-                pic.height = new_h
-                pic.left = int((slide_width - new_w) / 2)
-                pic.top = int((slide_height - new_h) / 2)
-            except Exception:
-                pass
-        except Exception:
-            # Se fallisce l'inserimento (formato non supportato), aggiungi messaggio
-            textbox = slide.shapes.add_textbox(left=Inches(1), top=Inches(1), width=Inches(8), height=Inches(1.5))
-            textbox.text_frame.text = f"Immagine non supportata: {img.name}"
-        
-        # Aggiungi sovraimpressione con nome file in basso a sinistra (sopra all'immagine)
-        try:
-            margin = Inches(0.3)
-            tb_height = Inches(0.6)
-            tb = slide.shapes.add_textbox(left=margin, top=slide_height - tb_height - margin, width=slide_width - 2 * margin, height=tb_height)
-            # Sfondo scuro semi-trasparente per leggibilità
-            try:
-                fill = tb.fill
-                fill.solid()
-                fill.fore_color.rgb = RGBColor(0, 0, 0)
-                # La trasparenza potrebbe non essere supportata in tutte le versioni
-                try:
-                    fill.fore_color.transparency = 0.4  # 40% trasparente
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            # Rimuovi bordo
-            try:
-                tb.line.fill.background()
-            except Exception:
-                pass
-            # Testo
-            tf = tb.text_frame
-            tf.clear()
-            p = tf.paragraphs[0]
-            run = p.add_run()
-            run.text = img.name
-            font = run.font
-            font.bold = True
-            font.size = Pt(16)
-            font.color.rgb = RGBColor(255, 255, 255)
-        except Exception:
-            pass
-        # Transizione fade per la slide dell'immagine
-        _add_fade_transition(slide)
-
-        # Slide bianca tra un'immagine e l'altra (non dopo l'ultima)
-        if idx < len(image_paths) - 1:
-            blank_slide = prs.slides.add_slide(blank_layout)
-            _add_fade_transition(blank_slide)
-
-    prs.save(str(ppt_path))
-    print(f"PPTX creato in: {ppt_path}")
-    return ppt_path
+        val = input(prompt)
+    except EOFError:
+        # Treat EOF as exit request
+        print("\nUscita richiesta.")
+        sys.exit(0)
+    if _exit_requested(val):
+        print("Uscita richiesta.")
+        sys.exit(0)
+    return val
 
 
-def slugify_filename(name: str) -> str:
-    """Normalizza un nome file (senza percorso) rendendolo più "sicuro".
-    - minuscole
-    - spazi e caratteri non alfanumerici -> underscore
-    - riduce underscore ripetuti
-    Mantiene l'estensione originale.
-    """
-    p = Path(name)
-    stem = p.stem.lower()
-    ext = p.suffix  # include il punto, es. ".txt"
-
-    # Sostituzioni: tutto ciò che non è a-z, 0-9, trattino o underscore diventa underscore
-    stem = stem.replace(" ", "_")
-    stem = re.sub(r"[^a-z0-9_-]", "_", stem)
-    stem = re.sub(r"_+", "_", stem).strip("._-")
-    if not stem:
-        stem = "file"
-    return f"{stem}{ext.lower()}"
-
-
-def ensure_unique(path: Path) -> Path:
-    """Se il file esiste già, aggiunge un suffisso -1, -2, ... prima dell'estensione."""
-    if not path.exists():
-        return path
-    counter = 1
-    stem = path.stem
-    ext = path.suffix
-    parent = path.parent
+def _collect_jurors() -> list[str]:
+    jurors: list[str] = []
     while True:
-        candidate = parent / f"{stem}-{counter}{ext}"
-        if not candidate.exists():
-            return candidate
-        counter += 1
+        name = _input_or_exit("Nome giurato (lascia vuoto per terminare): ")
+        if not name.strip():
+            break
+        clean = name.strip()
+        jurors.append(clean)
+    return jurors
 
 
-def discover_files(base_dir: Path, out_dir: Path, include_hidden: bool) -> List[Path]:
-    """Ritorna la lista dei file immagine (non directory) nella cartella base_dir da processare.
-    Esclude: script stesso, cartella out, file dentro out, directory e (di default) file nascosti.
-    Nota: da richiesta, SOLO le immagini vengono spostate/renominate.
-    """
-    files = []
-    script_path = Path(__file__).resolve()
-    for entry in base_dir.iterdir():
-        # Salta la cartella di output
-        if entry.resolve() == out_dir.resolve():
-            continue
-        # Salta directory
-        if entry.is_dir():
-            continue
-        # Salta lo script stesso
-        if entry.resolve() == script_path:
-            continue
-        # Salta (di default) i file nascosti
-        if not include_hidden and entry.name.startswith('.'): 
-            continue
-        # Considera solo immagini
-        if not is_image_file(entry):
-            continue
-        files.append(entry)
-    return files
-
-
-def group_out_dir_for(path: Path, out_dir: Path) -> Path:
-    """Ritorna la cartella di output per una data estensione."""
-    ext = path.suffix.lower().lstrip('.')
-    if not ext:
-        ext = 'unknown'
-    return out_dir / ext
-
-
-def generate_html(out_dir: Path, filenames: List[str]) -> None:
-    """Genera un file HTML con una lista di <p> per i nomi passati."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    html_path = out_dir / 'index.html'
-    lines = [
-        '<!doctype html>',
-        '<html lang="it">',
-        '<head>',
-        '  <meta charset="utf-8">',
-        '  <meta name="viewport" content="width=device-width, initial-scale=1">',
-        '  <title>Elenco file</title>',
-        '  <style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;margin:2rem;} p{margin:.25rem 0}</style>',
-        '</head>',
-        '<body>',
-        '  <h1>Elenco file</h1>',
+def _collect_criteria() -> list[str]:
+    criteria: list[str] = []
+    placeholders = [
+        "Attinenza al tema",
+        "Tecnica",
+        "Creatività",
+        "Impressione generale",
     ]
-    for name in filenames:
-        lines.append(f"  <p>{html.escape(name)}</p>")
-    lines += ['</body>', '</html>']
-    html_path.write_text("\n".join(lines), encoding='utf-8')
+    # First four with placeholders
+    for ph in placeholders:
+        ans = _input_or_exit(
+            f"Inserisci criterio [{ph}] (Invio per confermare '{ph}', '-' per scartare): "
+        ).strip()
+        if ans == "":
+            criteria.append(ph)
+        elif ans == "-":
+            # skip this placeholder
+            continue
+        else:
+            criteria.append(ans)
+    # Additional criteria, optional
+    while True:
+        more = _input_or_exit(
+            "Aggiungi un altro criterio (lascia vuoto per terminare): "
+        ).strip()
+        if more == "":
+            break
+        criteria.append(more)
+    return criteria
 
 
-def rename_file(src: Path, dry_run: bool) -> Tuple[Path, str]:
-    """Rinomina il file src nel suo stesso percorso usando slugify.
-    Ritorna (new_path, new_name). Se dry_run è True, non cambia nulla.
+def _collect_criteria_from(placeholders: list[str]) -> list[str]:
+    criteria: list[str] = []
+    # Use provided placeholders in order
+    for ph in placeholders:
+        ans = _input_or_exit(
+            f"Inserisci criterio [{ph}] (Invio per confermare '{ph}', '-' per scartare): "
+        ).strip()
+        if ans == "":
+            criteria.append(ph)
+        elif ans == "-":
+            continue
+        else:
+            criteria.append(ans)
+    # Allow adding more
+    while True:
+        more = _input_or_exit(
+            "Aggiungi un altro criterio (lascia vuoto per terminare): "
+        ).strip()
+        if more == "":
+            break
+        criteria.append(more)
+    return criteria
+
+
+def _read_existing_criteria(csv_path: Path) -> list[str]:
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            first_row = next(reader, [])
+            # Criteria are from second column onwards
+            return [c for c in first_row[1:] if c != ""]
+    except Exception:
+        return []
+
+
+def _read_existing_titles(csv_path: Path) -> list[str]:
+    """Read titles from the first column (rows starting from the second)."""
+    titles: list[str] = []
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            # skip header
+            header = next(reader, None)
+            for row in reader:
+                if not row:
+                    continue
+                titles.append(row[0])
+    except Exception:
+        pass
+    return titles
+
+
+def _write_consolidated_csv(csv_path: Path, criteria: list[str], titles: list[str]) -> None:
+    header = [""] + criteria
+    rows = [header]
+    for t in titles:
+        rows.append([t] + [""] * len(criteria))
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerows(rows)
+
+
+def _extract_title_from_filename(path: Path) -> str:
+    """Extract the photo title from a filename like
+    nome_cognome_eventuale_secondo_nome_1_titolo_dell_immagine.jpg
+    and convert it to "Titolo dell immagine".
+
+    Rules:
+    - Split stem on underscores; find the first purely numeric token; title is the rest.
+    - Join title tokens with spaces.
+    - Make lowercase and capitalize first letter of the whole string.
+    - If pattern not matched, fallback to stem with underscores -> spaces and capitalize first letter.
     """
-    new_name = slugify_filename(src.name)
-    new_path = ensure_unique(src.with_name(new_name))
-    if new_path == src:
-        # Nessun cambiamento
-        return src, src.name
-    if dry_run:
-        print(f"[DRY-RUN] Rinominerò: '{src.name}' -> '{new_path.name}'")
-        return new_path, new_path.name
-    print(f"Rinomino: '{src.name}' -> '{new_path.name}'")
-    src.rename(new_path)
-    return new_path, new_path.name
-
-
-def copy_to_out(src: Path, out_dir: Path, dry_run: bool) -> Path:
-    target_dir = group_out_dir_for(src, out_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_path = ensure_unique(target_dir / src.name)
-    if dry_run:
-        print(f"[DRY-RUN] Copierei: '{src.name}' -> '{target_path}'")
-        return target_path
-    print(f"Copio: '{src.name}' -> '{target_path}'")
-    shutil.copy2(src, target_path)
-    return target_path
+    stem = path.stem
+    parts = stem.split("_")
+    title_tokens: list[str] = []
+    # Find first numeric token position
+    idx = None
+    for i, tok in enumerate(parts):
+        if tok.isdigit():
+            idx = i
+            break
+    if idx is not None and idx + 1 < len(parts):
+        title_tokens = parts[idx + 1 :]
+    else:
+        title_tokens = parts
+    raw = " ".join(title_tokens).strip()
+    raw = raw.replace("  ", " ")
+    raw = raw.lower()
+    if raw:
+        return raw[0].upper() + raw[1:]
+    return stem.replace("_", " ")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Rinomina, organizza e indicizza i file nella cartella corrente.")
-    parser.add_argument('--dry-run', action='store_true', help='Mostra le azioni senza eseguirle')
-    parser.add_argument('--no-rename', action='store_true', help='Non rinomina i file sorgente')
-    parser.add_argument('--out', default='out', help='Cartella di output (default: out)')
-    parser.add_argument('--include-hidden', action='store_true', help='Includi file nascosti (che iniziano con .)')
-    parser.add_argument('--ppt', action='store_true', help='Crea un file PPTX con le immagini trovate (richiede python-pptx)')
-    parser.add_argument('--ppt-name', default='images.pptx', help="Nome del file PPTX da creare (default: images.pptx). Verrà creato in OUT/PPT/")
-    args = parser.parse_args()
+    print("Orizzonti fotografici - setup")
+    competition_name = _input_or_exit("Inserisci il nome del concorso: ")
+    safe_name = _sanitize_name(competition_name)
+    year = datetime.datetime.now().year
+    folder_name = f"{safe_name} {year}"
 
-    base_dir = Path.cwd()
-    out_dir = (base_dir / args.out).resolve()
+    base = Path.cwd() / folder_name
 
-    print(f"Base: {base_dir}")
-    print(f"Output: {out_dir}")
-    if args.dry_run:
-        print("Modalità DRY-RUN: nessuna modifica verrà applicata.")
+    # 1) Base folder: crea solo se non esiste
+    base_existed = base.exists()
+    if not base_existed:
+        base.mkdir(parents=True, exist_ok=True)
+        print(f"Creata cartella: {base}")
 
-    files = discover_files(base_dir, out_dir, include_hidden=args.include_hidden)
-    if not files:
-        print("Nessun file da processare.")
+    # 2) Sottocartelle da gestire individualmente
+    subfolders = ["pictures", "presentations", "spreadsheet", "leaderboard"]
+    created = {}
+    for sub in subfolders:
+        path = base / sub
+        if path.exists():
+            created[sub] = False
+        else:
+            path.mkdir(parents=True, exist_ok=True)
+            created[sub] = True
+            print(f"Creata cartella: {path}")
+
+    # 2b) Se ci sono già voti di almeno un giudice, chiedi cosa fare
+    judges_dir = base / "judges"
+    judge_csvs_present = bool(_find_judge_csvs(judges_dir))
+    skip_leaderboard = False
+    if judge_csvs_present:
+        # Calcola percorso del CSV consolidato per eventuale leaderboard-only
+        snake_master = _make_snake(f"{folder_name} giuria")
+        spreadsheet_dir = base / "spreadsheet"
+        csv_master = spreadsheet_dir / f"{snake_master}.csv"
+        choice = _input_or_exit(
+            "Sono presenti dei voti dei giudici. Scegli: [1] Modifica presentazione, criteri, giudici (default), "
+            "[2] Crea leaderboard: "
+        ).strip()
+        if choice == "2":
+            # Solo leaderboard
+            _generate_leaderboard(base, csv_master)
+            return
+        else:
+            # Tutte le altre operazioni, escludendo la leaderboard
+            skip_leaderboard = True
+
+    # 3) Logica specifica per 'pictures'
+    pictures_path = base / "pictures"
+    if created.get("pictures", False):
+        # La cartella pictures non esisteva ed è stata appena creata
+        print("Inserire le foto del concorso e riavviare l'eseguibile")
+        return
+    else:
+        # La cartella pictures esisteva già: elenca file .jpg/.jpeg se presenti
+        if pictures_path.exists():
+            photo_paths = [p for p in pictures_path.iterdir()
+                           if p.is_file() and p.suffix.lower() in {'.jpg', '.jpeg'}]
+            photos = [p.name for p in photo_paths]
+            if photos:
+                print("Foto trovate (jpg/jpeg):")
+                for name in sorted(photos):
+                    print(name)
+                # Proceed to jurors and criteria collection
+                judges_dir = base / "judges"
+                if judges_dir.exists():
+                    existing_judges = [d.name for d in judges_dir.iterdir() if d.is_dir()]
+                    if existing_judges:
+                        print("Giurati già presenti:")
+                        for j in sorted(existing_judges):
+                            print(f"- {j}")
+                jurors = _collect_jurors()
+                # Do not block CSV synchronization if no jurors were added; just inform
+                if not jurors and not (judges_dir.exists() and any(d.is_dir() for d in judges_dir.iterdir())):
+                    print("Nessun giurato inserito. Procedo comunque con la gestione del CSV.")
+                # Create judges directory and one subfolder per juror (only new ones)
+                judges_dir.mkdir(parents=True, exist_ok=True)
+                for juror in jurors:
+                    juror_dir_name = _sanitize_name(juror)
+                    (judges_dir / juror_dir_name).mkdir(parents=True, exist_ok=True)
+                # Prepare CSV path (single consolidated CSV)
+                snake = "".join(ch.lower() if ch.isalnum() else "_" for ch in f"{folder_name} giuria")
+                while "__" in snake:
+                    snake = snake.replace("__", "_")
+                snake = snake.strip("_")
+                spreadsheet_dir = base / "spreadsheet"
+                spreadsheet_dir.mkdir(parents=True, exist_ok=True)
+                csv_path = spreadsheet_dir / f"{snake}.csv"
+                # Build current (title, path) pairs from pictures and shuffle to define spreadsheet order
+                title_path_pairs = [(_extract_title_from_filename(p), p) for p in photo_paths]
+                random.shuffle(title_path_pairs)
+                current_titles = [t for (t, _p) in title_path_pairs]
+                # If CSV already exists, read criteria and possibly modify; then sync titles and rewrite CSV
+                if csv_path.exists():
+                    existing_criteria = _read_existing_criteria(csv_path)
+                    if existing_criteria:
+                        print("Criteri attuali:")
+                        for c in existing_criteria:
+                            print(f"- {c}")
+                    else:
+                        print("Nessun criterio presente nel CSV esistente.")
+                    resp = _input_or_exit("Vuoi modificarli? [s/N]: ").strip().lower()
+                    if resp in {"s", "si", "sì", "y", "yes"}:
+                        # User wants to modify, collect using existing criteria as placeholders
+                        criteria_to_use = _collect_criteria_from(existing_criteria or [])
+                    else:
+                        criteria_to_use = existing_criteria
+                        print("I criteri esistenti verranno mantenuti.")
+                    # Compute additions/removals and print
+                    old_titles = _read_existing_titles(csv_path)
+                    added = [t for t in current_titles if t not in old_titles]
+                    removed = [t for t in old_titles if t not in current_titles]
+                    if added:
+                        print("Titoli aggiunti:")
+                        for t in added:
+                            print(f"+ {t}")
+                    if removed:
+                        print("Titoli rimossi:")
+                        for t in removed:
+                            print(f"- {t}")
+                    # Rewrite CSV with possibly updated criteria and randomized current titles
+                    _write_consolidated_csv(csv_path, criteria_to_use, current_titles)
+                    # Print aggiornato only if changes due to photos or criteria
+                    changed_due_to_photos = bool(added or removed)
+                    changed_due_to_criteria = criteria_to_use != existing_criteria
+                    if changed_due_to_photos or changed_due_to_criteria:
+                        print(f"Aggiornato: {csv_path}")
+                    # Create/overwrite PPT if there is at least one image and either photos changed or PPT is missing
+                    presentations_dir = base / "presentations"
+                    presentations_dir.mkdir(parents=True, exist_ok=True)
+                    snake_base = _make_snake(folder_name)
+                    ppt_path = presentations_dir / f"{snake_base}.pptx"
+                    need_ppt = bool(current_titles) and (changed_due_to_photos or not ppt_path.exists())
+                    if need_ppt:
+                        # Order slides exactly as the CSV title column
+                        titles_from_csv = _read_existing_titles(csv_path)
+                        ordered_pairs: list[tuple[str, Path]] = []
+                        title_map = {t: p for (t, p) in title_path_pairs}
+                        for t in titles_from_csv:
+                            if t in title_map:
+                                ordered_pairs.append((t, title_map[t]))
+                        _build_ppt(ppt_path, ordered_pairs)
+                        print(f"{'Aggiornata' if changed_due_to_photos else 'Creata'} presentazione: {ppt_path}")
+                    if not skip_leaderboard:
+                        _generate_leaderboard(base, csv_path)
+                    return
+                # Otherwise (no CSV yet): collect criteria and generate CSV
+                criteria = _collect_criteria()
+                if not criteria:
+                    print("Nessun criterio inserito. Il CSV conterrà solo i titoli delle foto.")
+                # Write new CSV
+                _write_consolidated_csv(csv_path, criteria, current_titles)
+                print(f"Creato: {csv_path}")
+                # Also create the PPT (first creation implies image list change)
+                if current_titles:
+                    presentations_dir = base / "presentations"
+                    presentations_dir.mkdir(parents=True, exist_ok=True)
+                    snake_base = _make_snake(folder_name)
+                    ppt_path = presentations_dir / f"{snake_base}.pptx"
+                    # Order slides exactly as the CSV title column
+                    titles_from_csv = _read_existing_titles(csv_path)
+                    ordered_pairs: list[tuple[str, Path]] = []
+                    title_map = {t: p for (t, p) in title_path_pairs}
+                    for t in titles_from_csv:
+                        if t in title_map:
+                            ordered_pairs.append((t, title_map[t]))
+                    _build_ppt(ppt_path, ordered_pairs)
+                    print(f"Creata presentazione: {ppt_path}")
+                if not skip_leaderboard:
+                    _generate_leaderboard(base, csv_path)
+                return
+            else:
+                # Nessun file jpg/jpeg presente: chiedi di inserire le foto
+                print("Inserire le foto del concorso e riavviare l'eseguibile")
+                return
+
+# Optional PowerPoint support
+try:
+    from pptx import Presentation  # type: ignore
+    from pptx.util import Inches, Pt, Emu  # type: ignore
+    from pptx.enum.text import PP_ALIGN  # type: ignore
+    from pptx.enum.text import MSO_ANCHOR  # type: ignore
+except Exception:  # pragma: no cover
+    Presentation = None  # type: ignore
+
+
+def _make_snake(s: str) -> str:
+    snake = "".join(ch.lower() if ch.isalnum() else "_" for ch in s)
+    while "__" in snake:
+        snake = snake.replace("__", "_")
+    return snake.strip("_")
+
+
+def _build_ppt(ppt_path: Path, title_path_pairs: list[tuple[str, Path]]) -> None:
+    """Create/overwrite a PPT with one slide per image in given order.
+    Image fills from top without cropping; a bottom text band shows the title.
+    """
+    if Presentation is None:
+        print("python-pptx non è installato: salto la generazione della presentazione.")
+        print("Per abilitarla: pip install python-pptx")
         return
 
-    processed_names: List[str] = []
+    prs = Presentation()
+    # Ensure a white background (default is white; keep as is).
+    blank_layout = prs.slide_layouts[6]  # blank
 
-    # 1) Rinomina (se abilitato)
-    renamed_paths: List[Path] = []
-    for f in files:
-        current = f
-        if not args.no_rename:
-            current, new_name = rename_file(f, dry_run=args.dry_run)
-        else:
-            new_name = f.name
-        renamed_paths.append(current if isinstance(current, Path) else Path(current))
-        processed_names.append(new_name)
+    # Dimensions
+    slide_w = prs.slide_width
+    slide_h = prs.slide_height
 
-    # 2) Crea cartelle e copia
-    copied_paths: List[Path] = []
-    for p in renamed_paths:
-        dest = copy_to_out(p, out_dir, dry_run=args.dry_run)
-        copied_paths.append(dest)
+    # Reserve a bottom band for the title text (further reduced)
+    bottom_band_h = Inches(0.25)
+    top_margin = Inches(0.0)
+    side_margin = Inches(0.0)
 
-    # 3) Genera HTML
-    generate_html(out_dir, processed_names)
-    if args.dry_run:
-        print(f"[DRY-RUN] Genererei HTML: {out_dir / 'index.html'}")
+    avail_w = slide_w - 2 * side_margin
+    avail_h = slide_h - bottom_band_h - top_margin
+
+    for title, img_path in title_path_pairs:
+        slide = prs.slides.add_slide(blank_layout)
+
+        # Add picture roughly sized, then adjust to fit maintaining aspect ratio
+        pic = slide.shapes.add_picture(str(img_path), left=side_margin, top=top_margin)
+        # Original image size in EMU
+        orig_w = pic.image.size[0]
+        orig_h = pic.image.size[1]
+        # Compute scale to fit into (avail_w, avail_h)
+        scale_w = avail_w / orig_w
+        scale_h = avail_h / orig_h
+        scale = min(scale_w, scale_h)
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        pic.width = new_w
+        pic.height = new_h
+        # Center horizontally within available width; keep anchored to top
+        pic.left = int((slide_w - new_w) / 2)
+        pic.top = top_margin  # anchored at top
+
+        # Bottom text box with the title
+        tx_left = Inches(0)
+        tx_top = slide_h - bottom_band_h
+        tx_width = slide_w
+        tx_height = bottom_band_h
+        textbox = slide.shapes.add_textbox(tx_left, tx_top, tx_width, tx_height)
+        tf = textbox.text_frame
+        tf.clear()
+        # Center text vertically and horizontally within the band
+        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+        p = tf.paragraphs[0]
+        p.alignment = PP_ALIGN.CENTER
+        run = p.add_run()
+        run.text = title
+        font = run.font
+        font.size = Pt(20)
+        # Default color is black; leave as black.
+
+    prs.save(str(ppt_path))
+
+def _extract_author_from_path(path: Path):
+    stem = path.stem
+    parts = stem.split("_")
+    title_tokens: list[str] = []
+    # Find first numeric token position
+    idx = None
+    for i, tok in enumerate(parts):
+        if tok.isdigit():
+            idx = i
+            break
+    if idx is not None and idx + 1 < len(parts):
+        title_tokens = parts[:idx]
     else:
-        print(f"HTML generato in: {out_dir / 'index.html'}")
+        title_tokens = parts
+    raw = " ".join(title_tokens).strip()
+    raw = raw.replace("  ", " ")
+    raw = raw.lower()
+    if raw:
+        return raw[0].upper() + raw[1:]
+    return stem.replace("_", " ")
 
-    # 4) (Opzionale) Genera PPTX da immagini
-    if args.ppt:
-        images = [p for p in copied_paths if is_image_file(p)]
-        if not images:
-            print("Nessuna immagine trovata per creare il PPTX.")
+def _build_leaderboard_ppt(ppt_path: Path, title_path_pairs: list[tuple[str, Path]]) -> None:
+    if Presentation is None:
+        print("python-pptx non è installato: salto la generazione della presentazione.")
+        print("Per abilitarla: pip install python-pptx")
+        return
+
+    prs = Presentation()
+    # Ensure a white background (default is white; keep as is).
+    blank_layout = prs.slide_layouts[6]  # blank
+
+    # Dimensions
+    slide_w = prs.slide_width
+    slide_h = prs.slide_height
+
+    for title, img_path in title_path_pairs:
+        title_slide = prs.slides.add_slide(blank_layout)
+
+        textbox = title_slide.shapes.add_textbox(0, 0, slide_w, slide_h)
+        tf = textbox.text_frame
+        tf.clear()
+
+        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+
+        p1 = tf.paragraphs[0]
+        p1.alignment = PP_ALIGN.CENTER
+        run1 = p1.add_run()
+        run1.text = title
+        font = run1.font
+        font.size = Pt(44)
+        font.bold = True
+
+        p2 = tf.add_paragraph()
+        p2.alignment = PP_ALIGN.CENTER
+        run2 = p2.add_run()
+        run2.text = _extract_author_from_path(img_path)
+        font2 = run2.font
+        font2.size = Pt(28)
+        font2.bold = False
+
+        img_slide = prs.slides.add_slide(blank_layout)
+
+        # Add picture roughly sized, then adjust to fit maintaining aspect ratio
+        pic = img_slide.shapes.add_picture(str(img_path), 0, 0)
+
+        img_w, img_h = pic.image.size
+
+        scale = slide_h / img_h
+
+        new_w = int(img_w * scale)
+        new_h = slide_h
+
+        pic.width = new_w
+        pic.height = new_h
+
+        pic.left = int((slide_w - new_w) / 2)
+        pic.top = 0
+
+    prs.save(str(ppt_path))
+
+def _find_judge_csvs(judges_dir: Path) -> list[Path]:
+    csvs: list[Path] = []
+    if not judges_dir.exists():
+        return csvs
+    for d in judges_dir.iterdir():
+        if d.is_dir():
+            for f in d.iterdir():
+                if f.is_file() and f.suffix.lower() == ".csv":
+                    csvs.append(f)
+    return csvs
+
+
+def _generate_leaderboard(base: Path, master_csv: Path) -> None:
+    """Generate leaderboard/classifica.csv based on judge CSVs.
+    Uses criteria and titles from the consolidated spreadsheet CSV.
+    """
+    leaderboard_dir = base / "leaderboard"
+    leaderboard_dir.mkdir(parents=True, exist_ok=True)
+
+    judges_dir = base / "judges"
+    judge_csvs = _find_judge_csvs(judges_dir)
+    if not judge_csvs:
+        return  # nothing to do
+
+    criteria = _read_existing_criteria(master_csv)
+    titles = _read_existing_titles(master_csv)
+    if not criteria or not titles:
+        return  # cannot build without structure
+
+    from collections import defaultdict
+
+    values: dict[tuple[str, str], list[float]] = defaultdict(list)  # (title, criterion) -> list of floats
+
+    for jcsv in judge_csvs:
+        try:
+            with jcsv.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, [])
+                # Map criterion name -> column index in this judge CSV
+                crit_to_idx: dict[str, int] = {}
+                for idx, name in enumerate(header[1:], start=1):
+                    if name:
+                        crit_to_idx[name] = idx
+                seen_titles: set[str] = set()
+                for row in reader:
+                    if not row:
+                        continue
+                    title = row[0]
+                    if title not in titles:
+                        # Skip unknown titles silently
+                        continue
+                    seen_titles.add(title)
+                    for crit in criteria:
+                        col = crit_to_idx.get(crit)
+                        if col is None:
+                            print(f"Voto mancante per titolo '{title}' criterio '{crit}' per il giudice '"
+                                  f"{jcsv.parent.name}' ("
+                                  f"colonna "
+                                  f"assente)")
+                            continue
+                        cell = row[col] if col < len(row) else ""
+                        if cell is None or str(cell).strip() == "":
+                            print(f"Voto mancante per titolo '{title}' criterio '{crit}' per il giudice '"
+                                  f"{jcsv.parent.name}'")
+                            continue
+                        s = str(cell).strip().replace(",", ".")
+                        try:
+                            num = float(s)
+                        except Exception:
+                            print(f"Voto non valido '{cell}' per titolo '{title}' criterio '{crit}' per il giudice '"
+                                  f"{jcsv.parent.name}'")
+                            continue
+                        values[(title, crit)].append(num)
+                # For titles not present at all in this judge CSV, count as missing per-criterion
+                missing_titles = [t for t in titles if t not in seen_titles]
+                for mt in missing_titles:
+                    for crit in criteria:
+                        print(f"Voto mancante per titolo '{mt}' criterio '{crit}' per il giudice '{jcsv.parent.name}' ("
+                              f"titolo assente)")
+        except Exception as e:
+            print(f"Impossibile leggere il file dei voti '{jcsv}': {e}")
+            continue
+
+    # Build leaderboard rows
+    out_rows: list[list[str]] = []
+    header = [""] + criteria + ["Totale", "Top10"]
+    out_rows.append(header)
+
+    scored: list[tuple[str, list[str], float]] = []  # (title, cells, total)
+    for title in titles:
+        row_cells: list[str] = []
+        criterion_means: list[float] = []
+        for crit in criteria:
+            nums = values.get((title, crit), [])
+            if nums:
+                avg = sum(nums) / len(nums)
+                criterion_means.append(avg)
+                row_cells.append(f"{avg:.3f}")
+            else:
+                row_cells.append("")
+        if criterion_means:
+            total = sum(criterion_means) / len(criterion_means)
         else:
-            create_ppt_from_images(out_dir, images, args.ppt_name, dry_run=args.dry_run)
+            total = float('-inf')  # mark as missing for sorting; will render as blank
+        scored.append((title, row_cells, total))
 
+    # Sort by Totale desc
+    scored.sort(key=lambda x: x[2], reverse=True)
 
-if __name__ == '__main__':
+    # Emit rows; render -inf as blank
+    for idx, (title, cells, total) in enumerate(scored, start=1):
+        total_str = "" if total == float('-inf') else f"{total:.3f}"
+        out_rows.append([title] + cells + [total_str])
+
+    leaderboard_csv = leaderboard_dir / "classifica.csv"
+    try:
+        with leaderboard_csv.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows(out_rows)
+        # We keep prints minimal; creation is implicit.
+    except Exception as e:
+        print(f"Errore nella scrittura della leaderboard '{leaderboard_csv}': {e}")
+    # Create pptx leaderboard if possible by taking top 10 images
+    if Presentation is not None:
+        top10 = [title for (title, _cells, total) in scored if total != float('-inf')][:10]
+        if top10:
+            title_path_map = {}
+            for p in (base / "pictures").iterdir():
+                if p.is_file() and p.suffix.lower() in {'.jpg', '.jpeg'}:
+                    extracted_title = _extract_title_from_filename(p)
+                    title_path_map[extracted_title] = p
+            top10_pairs = [(t, title_path_map[t]) for t in top10 if t in title_path_map]
+            if top10_pairs:
+                ppt_leaderboard_path = leaderboard_dir / "classifica.pptx"
+                _build_leaderboard_ppt(ppt_leaderboard_path, top10_pairs)
+    else:
+        print("python-pptx non è installato: salto la generazione della presentazione della classifica.")
+        print("Per abilitarla: pip install python-pptx")
+
+if __name__ == "__main__":
     main()
