@@ -3,8 +3,9 @@ import datetime
 import csv
 import sys
 import random
+import os
+import subprocess
 from pathlib import Path
-
 
 def _sanitize_name(name: str) -> str:
     invalid = '<>:"/\\|?*'
@@ -31,6 +32,16 @@ def _input_or_exit(prompt: str) -> str:
         sys.exit(0)
     return val
 
+def _open_folder(path: Path) -> None:
+    try:
+        if os.name == 'nt':  # Windows
+            os.startfile(str(path))
+        elif sys.platform == 'darwin':  # macOS
+            subprocess.run(['open', str(path)])
+        else:
+            print(f"Sistema operativo non supportato per l'apertura automatica: {os.name}.")
+    except Exception as e:
+        print(f"Errore durante l'apertura della cartella '{path}': {e}")
 
 def _collect_jurors() -> list[str]:
     jurors: list[str] = []
@@ -169,7 +180,13 @@ def _extract_title_from_filename(path: Path) -> str:
 
 
 def main() -> None:
-    print("Orizzonti fotografici - setup")
+    print("------------------------------------------------------------------")
+    print("Benvenuto nello strumento di gestione concorsi fotografici!")
+    print("Questo script ti aiuta a organizzare un concorso creando cartelle,")
+    print("fogli di calcolo e presentazioni per i giurati e la classifica.")
+    print("Segui le istruzioni passo dopo passo. Premi 'q' in qualsiasi momento per uscire.")
+    print("------------------------------------------------------------------\n")
+    print("### Setup del Concorso ###")
     competition_name = _input_or_exit("Inserisci il nome del concorso: ")
     safe_name = _sanitize_name(competition_name)
     year = datetime.datetime.now().year
@@ -181,7 +198,11 @@ def main() -> None:
     base_existed = base.exists()
     if not base_existed:
         base.mkdir(parents=True, exist_ok=True)
-        print(f"Creata cartella: {base}")
+        print(f"\nCreata cartella principale per il concorso: {base}")
+    else:
+        print(f"\nLa cartella {base} esiste già. Continuo a lavorarci.")
+
+    _open_folder(base)
 
     # 2) Sottocartelle da gestire individualmente
     subfolders = ["pictures", "presentations", "spreadsheet", "leaderboard"]
@@ -229,9 +250,11 @@ def main() -> None:
                            if p.is_file() and p.suffix.lower() in {'.jpg', '.jpeg'}]
             photos = [p.name for p in photo_paths]
             if photos:
-                print("Foto trovate (jpg/jpeg):")
+                print("\n### Foto Trovate ###")
+                print("Ho trovato le seguenti foto nella cartella 'pictures':")
                 for name in sorted(photos):
-                    print(name)
+                    print(f"- {name}")
+                print("\nOra raccogliamo i dati per i giurati e la valutazione.")
                 # Proceed to jurors and criteria collection
                 judges_dir = base / "judges"
                 if judges_dir.exists():
@@ -342,8 +365,21 @@ def main() -> None:
                 return
             else:
                 # Nessun file jpg/jpeg presente: chiedi di inserire le foto
-                print("Inserire le foto del concorso e riavviare l'eseguibile")
+                print("\n### Attenzione: Nessuna Foto Trovata ###")
+                print("Per procedere, inserisci le foto del concorso (file .jpg o .jpeg)")
+                print(f"nella cartella '{pictures_path}' e riavvia lo script.")
                 return
+    print("\n------------------------------------------------------------------")
+    print("Operazione completata con successo!")
+    print("Controlla le cartelle create per il tuo concorso:")
+    print(f"- **'pictures'**: contiene le foto.")
+    print(f"- **'spreadsheet'**: contiene il file CSV per la valutazione.")
+    print(f"- **'presentations'**: contiene la presentazione per la giuria.")
+    print("\nProssimi passi:")
+    print("1. Copia il file CSV dalla cartella 'spreadsheet' nella cartella di ogni giurato (es. judges/Mario_Rossi/).")
+    print("2. I giurati possono inserire i loro voti nel file CSV.")
+    print("3. Una volta che tutti i voti sono stati inseriti, esegui nuovamente lo script per generare la classifica finale!")
+    print("------------------------------------------------------------------")
 
 # Optional PowerPoint support
 try:
