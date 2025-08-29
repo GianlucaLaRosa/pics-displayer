@@ -19,3 +19,8 @@ __pycache__/
 build/
 dist/
 *.spec
+
+# Installer scripts
+get-pip.py
+
+Concorsi Orizzonti Fotografici

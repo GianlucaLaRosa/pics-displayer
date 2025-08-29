@@ -5,7 +5,32 @@ import sys
 import random
 import os
 import subprocess
+import re
+import shutil
+import json
 from pathlib import Path
+from collections import defaultdict
+
+# --- IMPOSTAZIONE SEPARATORE ---
+FILENAME_SEPARATOR = "--"
+
+# Tentativo di importare 'inquirer'. Se non riesce, useremo un fallback.
+try:
+    if not sys.stdout.isatty():
+        raise ImportError("Non è un terminale interattivo, fallback a input standard.")
+    import inquirer
+except ImportError:
+    inquirer = None
+
+try:
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+except ImportError:
+    Presentation = None
+
+
+# --- FUNZIONI DI UTILITÀ E INPUT ---
 
 def _sanitize_name(name: str) -> str:
     invalid = '<>:"/\\|?*'
@@ -13,7 +38,7 @@ def _sanitize_name(name: str) -> str:
     sanitized = sanitized.strip().rstrip(' .')
     while '  ' in sanitized:
         sanitized = sanitized.replace('  ', ' ')
-    return sanitized or 'Concorso'
+    return sanitized or 'Senza_Nome'
 
 
 def _exit_requested(s: str) -> bool:
@@ -23,8 +48,7 @@ def _exit_requested(s: str) -> bool:
 def _input_or_exit(prompt: str) -> str:
     try:
         val = input(prompt)
-    except EOFError:
-        # Treat EOF as exit request
+    except (EOFError, KeyboardInterrupt):
         print("\nUscita richiesta.")
         sys.exit(0)
     if _exit_requested(val):
@@ -32,106 +56,115 @@ def _input_or_exit(prompt: str) -> str:
         sys.exit(0)
     return val
 
+
+def _confirm_or_exit(message: str, default: bool = False) -> bool:
+    if inquirer:
+        full_message = f"{message.strip()} (premi Ctrl+C per uscire)"
+        questions = [inquirer.Confirm('confirm', message=full_message, default=default)]
+        try:
+            answers = inquirer.prompt(questions)
+            if answers is None: sys.exit(0)
+            return answers['confirm']
+        except (KeyboardInterrupt, EOFError):
+            print("\nUscita richiesta.");
+            sys.exit(0)
+    else:
+        prompt = f"{message.strip()} [s/n]: "
+        resp = _input_or_exit(prompt).strip().lower()
+        if resp == "": return default
+        return resp in {"s", "si", "sì", "y", "yes"}
+
+
 def _open_folder(path: Path) -> None:
     try:
-        if os.name == 'nt':  # Windows
+        if os.name == 'nt':
             os.startfile(str(path))
-        elif sys.platform == 'darwin':  # macOS
+        elif sys.platform == 'darwin':
             subprocess.run(['open', str(path)])
         else:
-            print(f"Sistema operativo non supportato per l'apertura automatica: {os.name}.")
+            subprocess.run(['xdg-open', str(path)])
     except Exception as e:
         print(f"Errore durante l'apertura della cartella '{path}': {e}")
 
-def _collect_jurors() -> list[str]:
-    jurors: list[str] = []
-    while True:
-        name = _input_or_exit("Nome giurato (lascia vuoto per terminare): ")
-        if not name.strip():
-            break
-        clean = name.strip()
-        jurors.append(clean)
-    return jurors
+
+def _make_snake(s: str) -> str:
+    snake = "".join(ch.lower() if ch.isalnum() else "_" for ch in s)
+    while "__" in snake: snake = snake.replace("__", "_")
+    return snake.strip("_")
 
 
-def _collect_criteria() -> list[str]:
-    criteria: list[str] = []
-    placeholders = [
-        "Attinenza al tema",
-        "Tecnica",
-        "Creatività",
-        "Impressione generale",
-    ]
-    # First four with placeholders
-    for ph in placeholders:
-        ans = _input_or_exit(
-            f"Inserisci criterio [{ph}] (Invio per confermare '{ph}', '-' per scartare): "
-        ).strip()
-        if ans == "":
-            criteria.append(ph)
-        elif ans == "-":
-            # skip this placeholder
-            continue
-        else:
-            criteria.append(ans)
-    # Additional criteria, optional
-    while True:
-        more = _input_or_exit(
-            "Aggiungi un altro criterio (lascia vuoto per terminare): "
-        ).strip()
-        if more == "":
-            break
-        criteria.append(more)
-    return criteria
+# --- NUOVA FUNZIONE FLESSIBILE PER LE DATE ---
+def _parse_date_flexible(date_str: str) -> datetime.date | None:
+    """Prova a leggere una data sia in formato GG/MM/AAAA che AAAA-MM-GG."""
+    if not date_str:
+        return None
+    try:
+        # Prova prima il nuovo formato (italiano)
+        return datetime.datetime.strptime(date_str, '%d/%m/%Y').date()
+    except ValueError:
+        try:
+            # Se fallisce, prova il vecchio formato (ISO)
+            return datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            # Se falliscono entrambi, la data non è valida
+            return None
 
 
-def _collect_criteria_from(placeholders: list[str]) -> list[str]:
-    criteria: list[str] = []
-    # Use provided placeholders in order
-    for ph in placeholders:
-        ans = _input_or_exit(
-            f"Inserisci criterio [{ph}] (Invio per confermare '{ph}', '-' per scartare): "
-        ).strip()
-        if ans == "":
-            criteria.append(ph)
-        elif ans == "-":
-            continue
-        else:
-            criteria.append(ans)
-    # Allow adding more
-    while True:
-        more = _input_or_exit(
-            "Aggiungi un altro criterio (lascia vuoto per terminare): "
-        ).strip()
-        if more == "":
-            break
-        criteria.append(more)
-    return criteria
+# --- GESTIONE LOG CONCORSI ---
 
+def _get_log_path(root_dir: Path) -> Path:
+    return root_dir / ".contests_log.json"
+
+
+def _read_log(log_path: Path) -> dict:
+    if not log_path.exists():
+        return {"contests": {}}
+    try:
+        with log_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
+        return {"contests": {}}
+
+
+def _write_log(log_path: Path, data: dict) -> None:
+    with log_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    if os.name == 'nt':
+        try:
+            subprocess.run(['attrib', '+H', str(log_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+
+
+def _update_contest_in_log(log_path: Path, contest_name: str, deadline: str | None):
+    log_data = _read_log(log_path)
+    if contest_name not in log_data["contests"]:
+        log_data["contests"][contest_name] = {}
+    log_data["contests"][contest_name]["deadline"] = deadline
+    _write_log(log_path, log_data)
+
+
+# --- FUNZIONI DI LETTURA/SCRITTURA FILE ---
 
 def _read_existing_criteria(csv_path: Path) -> list[str]:
+    if not csv_path.exists(): return []
     try:
         with csv_path.open("r", encoding="utf-8", newline="") as f:
             reader = csv.reader(f)
-            first_row = next(reader, [])
-            # Criteria are from second column onwards
-            return [c for c in first_row[1:] if c != ""]
+            return [c for c in next(reader, [])[1:] if c]
     except Exception:
         return []
 
 
 def _read_existing_titles(csv_path: Path) -> list[str]:
-    """Read titles from the first column (rows starting from the second)."""
-    titles: list[str] = []
+    if not csv_path.exists(): return []
+    titles = []
     try:
         with csv_path.open("r", encoding="utf-8", newline="") as f:
             reader = csv.reader(f)
-            # skip header
-            header = next(reader, None)
+            next(reader, None)
             for row in reader:
-                if not row:
-                    continue
-                titles.append(row[0])
+                if row: titles.append(row[0])
     except Exception:
         pass
     return titles
@@ -139,548 +172,629 @@ def _read_existing_titles(csv_path: Path) -> list[str]:
 
 def _write_consolidated_csv(csv_path: Path, criteria: list[str], titles: list[str]) -> None:
     header = [""] + criteria
-    rows = [header]
-    for t in titles:
-        rows.append([t] + [""] * len(criteria))
+    rows = [header] + [[t] + [""] * len(criteria) for t in titles]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerows(rows)
 
 
-def _extract_title_from_filename(path: Path) -> str:
-    """Extract the photo title from a filename like
-    nome_cognome_eventuale_secondo_nome_1_titolo_dell_immagine.jpg
-    and convert it to "Titolo dell immagine".
+def _normalize_string(text: str) -> str:
+    text = re.sub(r'(?<!^)(?=[A-Z])', ' ', text)
+    text = text.replace('_', ' ').replace('-', ' ')
+    return ' '.join(text.split()).strip()
 
-    Rules:
-    - Split stem on underscores; find the first purely numeric token; title is the rest.
-    - Join title tokens with spaces.
-    - Make lowercase and capitalize first letter of the whole string.
-    - If pattern not matched, fallback to stem with underscores -> spaces and capitalize first letter.
-    """
-    stem = path.stem
-    parts = stem.split("_")
-    title_tokens: list[str] = []
-    # Find first numeric token position
-    idx = None
-    for i, tok in enumerate(parts):
-        if tok.isdigit():
-            idx = i
-            break
-    if idx is not None and idx + 1 < len(parts):
-        title_tokens = parts[idx + 1 :]
+
+def _parse_filename(path: Path) -> tuple[str, str]:
+    stem = path.stem.strip()
+    raw_author, raw_title = "", ""
+    if FILENAME_SEPARATOR in stem:
+        parts = stem.split(FILENAME_SEPARATOR, 1)
+        raw_author, raw_title = parts[0], parts[1]
     else:
-        title_tokens = parts
-    raw = " ".join(title_tokens).strip()
-    raw = raw.replace("  ", " ")
-    raw = raw.lower()
-    if raw:
-        return raw[0].upper() + raw[1:]
-    return stem.replace("_", " ")
-
-
-def main() -> None:
-    print("------------------------------------------------------------------")
-    print("Benvenuto nello strumento di gestione concorsi fotografici!")
-    print("Questo script ti aiuta a organizzare un concorso creando cartelle,")
-    print("fogli di calcolo e presentazioni per i giurati e la classifica.")
-    print("Segui le istruzioni passo dopo passo. Premi 'q' in qualsiasi momento per uscire.")
-    print("------------------------------------------------------------------\n")
-    print("### Setup del Concorso ###")
-    competition_name = _input_or_exit("Inserisci il nome del concorso: ")
-    safe_name = _sanitize_name(competition_name)
-    year = datetime.datetime.now().year
-    folder_name = f"{safe_name} {year}"
-
-    base = Path.cwd() / folder_name
-
-    # 1) Base folder: crea solo se non esiste
-    base_existed = base.exists()
-    if not base_existed:
-        base.mkdir(parents=True, exist_ok=True)
-        print(f"\nCreata cartella principale per il concorso: {base}")
-    else:
-        print(f"\nLa cartella {base} esiste già. Continuo a lavorarci.")
-
-    _open_folder(base)
-
-    # 2) Sottocartelle da gestire individualmente
-    subfolders = ["pictures", "presentations", "spreadsheet", "leaderboard"]
-    created = {}
-    for sub in subfolders:
-        path = base / sub
-        if path.exists():
-            created[sub] = False
+        match = re.search(r'_(?P<num>\d+)_', stem)
+        if match:
+            raw_author, raw_title = stem[:match.start()], stem[match.end():]
         else:
-            path.mkdir(parents=True, exist_ok=True)
-            created[sub] = True
-            print(f"Creata cartella: {path}")
+            raw_title = stem
+    author = _normalize_string(raw_author).title()
+    title = _normalize_string(raw_title).capitalize()
+    return author or "Autore Sconosciuto", title or "Titolo Sconosciuto"
 
-    # 2b) Se ci sono già voti di almeno un giudice, chiedi cosa fare
-    judges_dir = base / "judges"
-    judge_csvs_present = bool(_find_judge_csvs(judges_dir))
-    skip_leaderboard = False
-    if judge_csvs_present:
-        # Calcola percorso del CSV consolidato per eventuale leaderboard-only
-        snake_master = _make_snake(f"{folder_name} giuria")
-        spreadsheet_dir = base / "spreadsheet"
-        csv_master = spreadsheet_dir / f"{snake_master}.csv"
-        choice = _input_or_exit(
-            "Sono presenti dei voti dei giudici. Scegli: [1] Modifica presentazione, criteri, giudici (default), "
-            "[2] Crea leaderboard: "
-        ).strip()
-        if choice == "2":
-            # Solo leaderboard
-            _generate_leaderboard(base, csv_master)
-            return
-        else:
-            # Tutte le altre operazioni, escludendo la leaderboard
-            skip_leaderboard = True
 
-    # 3) Logica specifica per 'pictures'
+# --- DASHBOARD DI STATO ---
+
+def _display_contest_status(base: Path, folder_name: str):
     pictures_path = base / "pictures"
-    if created.get("pictures", False):
-        # La cartella pictures non esisteva ed è stata appena creata
-        print("Inserire le foto del concorso e riavviare l'eseguibile")
-        return
+    judges_dir = base / "judges"
+    spreadsheet_dir = base / "spreadsheet"
+    csv_path = spreadsheet_dir / f"{_make_snake(folder_name)} giuria.csv"
+    log_path = _get_log_path(base.parent)
+    log_data = _read_log(log_path)
+
+    contest_info = log_data.get("contests", {}).get(folder_name, {})
+    deadline_str = contest_info.get("deadline")
+    deadline_date = _parse_date_flexible(deadline_str)
+
+    photo_count = len([p for p in pictures_path.iterdir() if p.is_file() and p.suffix.lower() in {'.jpg', '.jpeg'}])
+    criteria = _read_existing_criteria(csv_path)
+    jurors = [d.name for d in judges_dir.iterdir() if d.is_dir()]
+    submitted_votes = [p.parent.name for p in _find_judge_csvs(judges_dir)]
+
+    print("\n" + "---" * 15)
+    print(f"📊 STATO CONCORSO: {folder_name}")
+    if deadline_date:
+        is_expired = deadline_date < datetime.date.today()
+        print(f"  - Scadenza:           {deadline_str} {'(Scaduto)' if is_expired else ''}")
     else:
-        # La cartella pictures esisteva già: elenca file .jpg/.jpeg se presenti
-        if pictures_path.exists():
-            photo_paths = [p for p in pictures_path.iterdir()
-                           if p.is_file() and p.suffix.lower() in {'.jpg', '.jpeg'}]
-            photos = [p.name for p in photo_paths]
-            if photos:
-                print("\n### Foto Trovate ###")
-                print("Ho trovato le seguenti foto nella cartella 'pictures':")
-                for name in sorted(photos):
-                    print(f"- {name}")
-                print("\nOra raccogliamo i dati per i giurati e la valutazione.")
-                # Proceed to jurors and criteria collection
-                judges_dir = base / "judges"
-                if judges_dir.exists():
-                    existing_judges = [d.name for d in judges_dir.iterdir() if d.is_dir()]
-                    if existing_judges:
-                        print("Giurati già presenti:")
-                        for j in sorted(existing_judges):
-                            print(f"- {j}")
-                jurors = _collect_jurors()
-                # Do not block CSV synchronization if no jurors were added; just inform
-                if not jurors and not (judges_dir.exists() and any(d.is_dir() for d in judges_dir.iterdir())):
-                    print("Nessun giurato inserito. Procedo comunque con la gestione del CSV.")
-                # Create judges directory and one subfolder per juror (only new ones)
-                judges_dir.mkdir(parents=True, exist_ok=True)
-                for juror in jurors:
-                    juror_dir_name = _sanitize_name(juror)
-                    (judges_dir / juror_dir_name).mkdir(parents=True, exist_ok=True)
-                # Prepare CSV path (single consolidated CSV)
-                snake = "".join(ch.lower() if ch.isalnum() else "_" for ch in f"{folder_name} giuria")
-                while "__" in snake:
-                    snake = snake.replace("__", "_")
-                snake = snake.strip("_")
-                spreadsheet_dir = base / "spreadsheet"
-                spreadsheet_dir.mkdir(parents=True, exist_ok=True)
-                csv_path = spreadsheet_dir / f"{snake}.csv"
-                # Build current (title, path) pairs from pictures and shuffle to define spreadsheet order
-                title_path_pairs = [(_extract_title_from_filename(p), p) for p in photo_paths]
-                random.shuffle(title_path_pairs)
-                current_titles = [t for (t, _p) in title_path_pairs]
-                # If CSV already exists, read criteria and possibly modify; then sync titles and rewrite CSV
-                if csv_path.exists():
-                    existing_criteria = _read_existing_criteria(csv_path)
-                    if existing_criteria:
-                        print("Criteri attuali:")
-                        for c in existing_criteria:
-                            print(f"- {c}")
+        print("  - Scadenza:           Non impostata")
+    print("---" * 15)
+    print(f"  - Foto Trovate:       {photo_count}")
+    print(f"  - Criteri Definiti:   {len(criteria)}")
+    print(f"  - Giurati Registrati: {len(jurors)}")
+    print(f"  - Voti Consegnati:    {len(submitted_votes)} su {len(jurors)}")
+    print("---" * 15)
+
+
+# --- FUNZIONI AZIONE DEL MENU ---
+
+def _action_manage_jurors(judges_dir: Path):
+    while True:
+        print("\n### 🛠️  Gestione Giurati ###")
+        jurors = sorted([d.name for d in judges_dir.iterdir() if d.is_dir()])
+
+        choices = ["Aggiungi un nuovo giurato"]
+        if jurors:
+            choices.extend(["Rinomina un giurato esistente", "Elimina un giurato"])
+        choices.append("Torna al menu principale")
+
+        if inquirer:
+            questions = [inquirer.List('action', message="Scegli un'azione", choices=choices, carousel=True)]
+            answers = inquirer.prompt(questions)
+            if not answers: return
+            action = answers['action']
+        else:
+            for i, choice in enumerate(choices, 1): print(f"  [{i}] {choice}")
+            while True:
+                try:
+                    choice_num = int(_input_or_exit("Scelta: "))
+                    if 1 <= choice_num <= len(choices):
+                        action = choices[choice_num - 1]
+                        break
                     else:
-                        print("Nessun criterio presente nel CSV esistente.")
-                    resp = _input_or_exit("Vuoi modificarli? [s/N]: ").strip().lower()
-                    if resp in {"s", "si", "sì", "y", "yes"}:
-                        # User wants to modify, collect using existing criteria as placeholders
-                        criteria_to_use = _collect_criteria_from(existing_criteria or [])
-                    else:
-                        criteria_to_use = existing_criteria
-                        print("I criteri esistenti verranno mantenuti.")
-                    # Compute additions/removals and print
-                    old_titles = _read_existing_titles(csv_path)
-                    added = [t for t in current_titles if t not in old_titles]
-                    removed = [t for t in old_titles if t not in current_titles]
-                    if added:
-                        print("Titoli aggiunti:")
-                        for t in added:
-                            print(f"+ {t}")
-                    if removed:
-                        print("Titoli rimossi:")
-                        for t in removed:
-                            print(f"- {t}")
-                    # Rewrite CSV with possibly updated criteria and randomized current titles
-                    _write_consolidated_csv(csv_path, criteria_to_use, current_titles)
-                    # Print aggiornato only if changes due to photos or criteria
-                    changed_due_to_photos = bool(added or removed)
-                    changed_due_to_criteria = criteria_to_use != existing_criteria
-                    if changed_due_to_photos or changed_due_to_criteria:
-                        print(f"Aggiornato: {csv_path}")
-                    # Create/overwrite PPT if there is at least one image and either photos changed or PPT is missing
-                    presentations_dir = base / "presentations"
-                    presentations_dir.mkdir(parents=True, exist_ok=True)
-                    snake_base = _make_snake(folder_name)
-                    ppt_path = presentations_dir / f"{snake_base}.pptx"
-                    need_ppt = bool(current_titles) and (changed_due_to_photos or not ppt_path.exists())
-                    if need_ppt:
-                        # Order slides exactly as the CSV title column
-                        titles_from_csv = _read_existing_titles(csv_path)
-                        ordered_pairs: list[tuple[str, Path]] = []
-                        title_map = {t: p for (t, p) in title_path_pairs}
-                        for t in titles_from_csv:
-                            if t in title_map:
-                                ordered_pairs.append((t, title_map[t]))
-                        _build_ppt(ppt_path, ordered_pairs)
-                        print(f"{'Aggiornata' if changed_due_to_photos else 'Creata'} presentazione: {ppt_path}")
-                    if not skip_leaderboard:
-                        _generate_leaderboard(base, csv_path)
-                    return
-                # Otherwise (no CSV yet): collect criteria and generate CSV
-                criteria = _collect_criteria()
-                if not criteria:
-                    print("Nessun criterio inserito. Il CSV conterrà solo i titoli delle foto.")
-                # Write new CSV
-                _write_consolidated_csv(csv_path, criteria, current_titles)
-                print(f"Creato: {csv_path}")
-                # Also create the PPT (first creation implies image list change)
-                if current_titles:
-                    presentations_dir = base / "presentations"
-                    presentations_dir.mkdir(parents=True, exist_ok=True)
-                    snake_base = _make_snake(folder_name)
-                    ppt_path = presentations_dir / f"{snake_base}.pptx"
-                    # Order slides exactly as the CSV title column
-                    titles_from_csv = _read_existing_titles(csv_path)
-                    ordered_pairs: list[tuple[str, Path]] = []
-                    title_map = {t: p for (t, p) in title_path_pairs}
-                    for t in titles_from_csv:
-                        if t in title_map:
-                            ordered_pairs.append((t, title_map[t]))
-                    _build_ppt(ppt_path, ordered_pairs)
-                    print(f"Creata presentazione: {ppt_path}")
-                if not skip_leaderboard:
-                    _generate_leaderboard(base, csv_path)
-                return
-            else:
-                # Nessun file jpg/jpeg presente: chiedi di inserire le foto
-                print("\n### Attenzione: Nessuna Foto Trovata ###")
-                print("Per procedere, inserisci le foto del concorso (file .jpg o .jpeg)")
-                print(f"nella cartella '{pictures_path}' e riavvia lo script.")
-                return
-    print("\n------------------------------------------------------------------")
-    print("Operazione completata con successo!")
-    print("Controlla le cartelle create per il tuo concorso:")
-    print(f"- **'pictures'**: contiene le foto.")
-    print(f"- **'spreadsheet'**: contiene il file CSV per la valutazione.")
-    print(f"- **'presentations'**: contiene la presentazione per la giuria.")
-    print("\nProssimi passi:")
-    print("1. Copia il file CSV dalla cartella 'spreadsheet' nella cartella di ogni giurato (es. judges/Mario_Rossi/).")
-    print("2. I giurati possono inserire i loro voti nel file CSV.")
-    print("3. Una volta che tutti i voti sono stati inseriti, esegui nuovamente lo script per generare la classifica finale!")
-    print("------------------------------------------------------------------")
+                        print("Scelta non valida.")
+                except ValueError:
+                    print("Inserisci un numero.")
 
-# Optional PowerPoint support
-try:
-    from pptx import Presentation  # type: ignore
-    from pptx.util import Inches, Pt, Emu  # type: ignore
-    from pptx.enum.text import PP_ALIGN  # type: ignore
-    from pptx.enum.text import MSO_ANCHOR  # type: ignore
-except Exception:  # pragma: no cover
-    Presentation = None  # type: ignore
+        if "Aggiungi" in action:
+            while True:
+                name = _input_or_exit("Nome nuovo giurato (vuoto per terminare): ").strip()
+                if not name: break
+                safe_name = _sanitize_name(name)
+                if (judges_dir / safe_name).exists():
+                    print(f"ATTENZIONE: Giurato '{safe_name}' esiste già.")
+                else:
+                    (judges_dir / safe_name).mkdir(parents=True, exist_ok=True)
+                    print(f"✅ Creata cartella per: {safe_name}")
+
+        elif "Rinomina" in action:
+            if not inquirer:
+                print("Funzione disponibile solo in modalità interattiva.")
+                continue
+            q = [inquirer.List('old_name', message="Quale giurato vuoi rinominare?", choices=jurors)]
+            answers = inquirer.prompt(q)
+            if not answers: continue
+            old_name = answers['old_name']
+            new_name_raw = _input_or_exit(f"Nuovo nome per '{old_name}': ").strip()
+            if new_name_raw:
+                new_name = _sanitize_name(new_name_raw)
+                if (judges_dir / new_name).exists():
+                    print(f"ERRORE: Esiste già un giurato di nome '{new_name}'.")
+                else:
+                    (judges_dir / old_name).rename(judges_dir / new_name)
+                    print(f"✅ '{old_name}' rinominato in '{new_name}'.")
+
+        elif "Elimina" in action:
+            if not inquirer:
+                print("Funzione disponibile solo in modalità interattiva.")
+                continue
+            q = [inquirer.List('del_name', message="Quale giurato vuoi eliminare?", choices=jurors)]
+            answers = inquirer.prompt(q)
+            if not answers: continue
+            name_to_delete = answers['del_name']
+            if _confirm_or_exit(f"Sei sicuro di voler eliminare '{name_to_delete}' e i suoi voti?", default=False):
+                shutil.rmtree(judges_dir / name_to_delete)
+                print(f"🗑️  Giurato '{name_to_delete}' eliminato.")
+
+        elif "Torna" in action:
+            break
 
 
-def _make_snake(s: str) -> str:
-    snake = "".join(ch.lower() if ch.isalnum() else "_" for ch in s)
-    while "__" in snake:
-        snake = snake.replace("__", "_")
-    return snake.strip("_")
+def _action_sync_files(base: Path, folder_name: str):
+    print("\n### 🔄 Sincronizzazione Foto e Criteri ###")
+    pictures_path = base / "pictures"
+    photo_paths = [p for p in pictures_path.iterdir() if p.is_file() and p.suffix.lower() in {'.jpg', '.jpeg'}]
+    photos_exist = bool(photo_paths)
 
+    spreadsheet_dir = base / "spreadsheet"
+    csv_path = spreadsheet_dir / f"{_make_snake(folder_name)} giuria.csv"
 
-def _build_ppt(ppt_path: Path, title_path_pairs: list[tuple[str, Path]]) -> None:
-    """Create/overwrite a PPT with one slide per image in given order.
-    Image fills from top without cropping; a bottom text band shows the title.
-    """
-    if Presentation is None:
-        print("python-pptx non è installato: salto la generazione della presentazione.")
-        print("Per abilitarla: pip install python-pptx")
+    existing_criteria = _read_existing_criteria(csv_path)
+    print("\nCriteri attuali:", ", ".join(existing_criteria) if existing_criteria else "Nessuno")
+    if _confirm_or_exit("Vuoi modificare i criteri?", default=not existing_criteria):
+        final_criteria = _collect_criteria_from(
+            existing_criteria or ["Attinenza al tema", "Tecnica", "Creatività", "Impressione generale"])
+    else:
+        final_criteria = existing_criteria
+    criteria_changed = final_criteria != existing_criteria
+
+    photos_changed = False
+    current_titles = []
+    if photos_exist:
+        current_titles = sorted([_parse_filename(p)[1] for p in photo_paths])
+        old_titles = _read_existing_titles(csv_path)
+        photos_changed = sorted(current_titles) != sorted(old_titles)
+    else:
+        print("\nNessuna foto trovata. La sincronizzazione riguarderà solo i criteri.")
+        if _read_existing_titles(csv_path): photos_changed = True
+
+    if not photos_changed and not criteria_changed:
+        print("\nNessuna modifica rilevata. Tutto è già sincronizzato.")
+        _input_or_exit("Premi Invio per continuare...")
         return
 
+    print("\n--- Anteprima Modifiche ---")
+    if photos_changed and photos_exist:
+        print(f"  +/- Verranno sincronizzate {len(current_titles)} foto.")
+    elif photos_changed and not photos_exist:
+        print("  - Rilevata la rimozione di tutte le foto.")
+    if criteria_changed: print("  ✏️ I criteri di valutazione sono stati modificati.")
+    print("--------------------------")
+
+    if _confirm_or_exit("Procedere con le modifiche?", default=True):
+        titles_for_csv = current_titles
+        if photos_changed and photos_exist: random.shuffle(titles_for_csv)
+
+        _write_consolidated_csv(csv_path, final_criteria, titles_for_csv)
+        print(f"✅ File '{csv_path.name}' aggiornato.")
+
+        if photos_exist:
+            presentations_dir = base / "presentations"
+            ppt_path = presentations_dir / f"{_make_snake(folder_name)}.pptx"
+            parsed_photos = {_parse_filename(p)[1]: p for p in photo_paths}
+            ordered_pairs = [(t, parsed_photos[t]) for t in titles_for_csv if t in parsed_photos]
+            _build_ppt(ppt_path, ordered_pairs)
+            print(f"✅ Presentazione '{ppt_path.name}' aggiornata.")
+    else:
+        print("❌ Operazione annullata.")
+
+    _input_or_exit("Premi Invio per tornare al menu...")
+
+
+def _action_generate_leaderboard(base: Path, folder_name: str):
+    print("\n### 🏆 Generazione Classifica Finale ###")
+    pictures_path = base / "pictures"
+    judges_dir = base / "judges"
+    spreadsheet_dir = base / "spreadsheet"
+    csv_path = spreadsheet_dir / f"{_make_snake(folder_name)} giuria.csv"
+
+    photo_paths = [p for p in pictures_path.iterdir() if p.is_file()]
+    criteria = _read_existing_criteria(csv_path)
+    juror_dirs = [d for d in judges_dir.iterdir() if d.is_dir()]
+    submitted_csvs = _find_judge_csvs(judges_dir)
+
+    can_generate = all([photo_paths, criteria, juror_dirs, submitted_csvs])
+
+    if not can_generate:
+        print("Impossibile generare la classifica. Condizioni non soddisfatte:")
+        if not photo_paths: print("  - ❌ Nessuna foto trovata.")
+        if not criteria: print("  - ❌ Nessun criterio definito.")
+        if not juror_dirs: print("  - ❌ Nessun giurato registrato.")
+        if not submitted_csvs: print("  - ❌ Nessun giurato ha consegnato i voti.")
+        _input_or_exit("\nPremi Invio per tornare al menu...")
+        return
+
+    _generate_leaderboard_logic(base, csv_path)
+    _open_folder(base / "leaderboard")
+    _input_or_exit("Premi Invio per tornare al menu...")
+
+
+def _action_edit_deadline(root_dir: Path, contest_name: str):
+    print("\n### ✏️  Modifica Data di Scadenza ###")
+    log_path = _get_log_path(root_dir)
+    log_data = _read_log(log_path)
+    current_deadline = log_data.get("contests", {}).get(contest_name, {}).get("deadline")
+
+    print(f"Data di scadenza attuale: {current_deadline or 'Non impostata'}")
+
+    while True:
+        new_date_str = _input_or_exit("Nuova data (GG/MM/AAAA) o vuoto per rimuovere: ").strip()
+        if not new_date_str:
+            _update_contest_in_log(log_path, contest_name, None)
+            print("✅ Data di scadenza rimossa.")
+            break
+        try:
+            datetime.datetime.strptime(new_date_str, '%d/%m/%Y')
+            _update_contest_in_log(log_path, contest_name, new_date_str)
+            print(f"✅ Data di scadenza aggiornata a {new_date_str}.")
+            break
+        except ValueError:
+            print("Formato data non valido. Usa GG/MM/AAAA. Riprova.")
+
+    _input_or_exit("Premi Invio per tornare al menu...")
+
+
+# --- LOGICA PRINCIPALE (CORE) ---
+
+def _select_or_create_contest(root_dir: Path) -> tuple[Path, str] | None:
+    """Seleziona un concorso o ne crea uno nuovo, gestendo i separatori."""
+    log_path = _get_log_path(root_dir)
+    log_data = _read_log(log_path)
+    today = datetime.date.today()
+
+    existing_contests = sorted([d.name for d in root_dir.iterdir() if d.is_dir()])
+    active_contests, expired_contests = [], []
+
+    for contest_name in existing_contests:
+        info = log_data.get("contests", {}).get(contest_name, {})
+        deadline_str = info.get("deadline")
+        deadline_date = _parse_date_flexible(deadline_str)
+        if deadline_date:
+            if deadline_date < today:
+                expired_contests.append(contest_name)
+            else:
+                active_contests.append(contest_name)
+        else:
+            active_contests.append(contest_name)
+
+    new_opt = ">> CREA UN NUOVO CONCORSO <<"
+    active_separator = "--- Concorsi Attivi ---"
+    expired_separator = "--- Concorsi Scaduti ---"
+    separators = [active_separator, expired_separator]
+
+    while True:
+        choices = [new_opt]
+        if active_contests:
+            choices.append(active_separator)
+            choices.extend(active_contests)
+        if expired_contests:
+            choices.append(expired_separator)
+            choices.extend(expired_contests)
+
+        if inquirer:
+            q = [inquirer.List('contest', message="Scegli un'azione o un concorso", choices=choices,
+                               carousel=True)]
+            answers = inquirer.prompt(q)
+            if not answers: return None
+            chosen_name = answers['contest']
+
+            if chosen_name in separators:
+                print("Selezione non valida. Scegli un nome di concorso o un'azione dalla lista.")
+                continue
+        else:
+            print("\nScegli un'opzione:")
+            print(f"  [1] {new_opt}")
+
+            all_contests = active_contests + expired_contests
+            current_idx = 2
+
+            if active_contests:
+                print("\n--- Concorsi Attivi ---")
+                for name in active_contests:
+                    print(f"  [{current_idx}] {name}")
+                    current_idx += 1
+
+            if expired_contests:
+                print("\n--- Concorsi Scaduti ---")
+                for name in expired_contests:
+                    print(f"  [{current_idx}] {name}")
+                    current_idx += 1
+
+            while True:
+                try:
+                    choice = int(_input_or_exit("\nScelta: "))
+                    if choice == 1:
+                        chosen_name = new_opt
+                        break
+                    elif 2 <= choice < 2 + len(all_contests):
+                        chosen_name = all_contests[choice - 2]
+                        break
+                    else:
+                        print("Scelta non valida.")
+                except ValueError:
+                    print("Inserisci un numero.")
+
+        break
+
+    if chosen_name == new_opt:
+        name = _input_or_exit("Nome del nuovo concorso: ")
+        safe_name = _sanitize_name(name)
+
+        while True:
+            deadline_str = _input_or_exit("Data di scadenza (GG/MM/AAAA, opzionale): ").strip()
+            if not deadline_str:
+                deadline = None
+                break
+            try:
+                datetime.datetime.strptime(deadline_str, '%d/%m/%Y')
+                deadline = deadline_str
+                break
+            except ValueError:
+                print("Formato data non valido. Riprova.")
+
+        _update_contest_in_log(log_path, safe_name, deadline)
+        return root_dir / safe_name, safe_name
+    else:
+        return root_dir / chosen_name, chosen_name
+
+
+def _collect_criteria_from(placeholders: list[str]) -> list[str]:
+    criteria = []
+    print("\n### Definizione/Modifica Criteri di Valutazione ###")
+    prompt_suffix = "(Invio per usare, 'no' per scartare, o scrivi per sostituire): "
+
+    for ph in placeholders:
+        ans = _input_or_exit(f"Criterio [{ph}] {prompt_suffix}").strip()
+        if ans == "":
+            criteria.append(ph)
+        elif ans.lower() != "no":
+            criteria.append(ans)
+
+    while True:
+        more = _input_or_exit("Aggiungi un altro criterio (vuoto per finire): ").strip()
+        if not more: break
+        criteria.append(more)
+    return criteria
+
+
+# --- LOGICA DI GENERAZIONE (PPT E CLASSIFICA) ---
+def _build_ppt(ppt_path: Path, title_path_pairs: list[tuple[str, Path]]) -> None:
+    if Presentation is None:
+        print("\nAVVISO: `python-pptx` non installato. Salto creazione presentazione.")
+        return
     prs = Presentation()
-    # Ensure a white background (default is white; keep as is).
-    blank_layout = prs.slide_layouts[6]  # blank
-
-    # Dimensions
-    slide_w = prs.slide_width
-    slide_h = prs.slide_height
-
-    # Reserve a bottom band for the title text (further reduced)
-    bottom_band_h = Inches(0.25)
-    top_margin = Inches(0.0)
-    side_margin = Inches(0.0)
-
-    avail_w = slide_w - 2 * side_margin
-    avail_h = slide_h - bottom_band_h - top_margin
+    slide_w, slide_h = prs.slide_width, prs.slide_height
+    blank_layout = prs.slide_layouts[6]
+    bottom_band_h, top_margin, side_margin = Inches(0.4), Inches(0.1), Inches(0.1)
+    avail_w, avail_h = slide_w - 2 * side_margin, slide_h - bottom_band_h - top_margin
 
     for title, img_path in title_path_pairs:
         slide = prs.slides.add_slide(blank_layout)
+        try:
+            pic = slide.shapes.add_picture(str(img_path), left=side_margin, top=top_margin)
+            orig_w, orig_h = pic.image.size
+            scale = min(avail_w / orig_w, avail_h / orig_h)
+            new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+            pic.width, pic.height = new_w, new_h
+            pic.left, pic.top = int((slide_w - new_w) / 2), top_margin
 
-        # Add picture roughly sized, then adjust to fit maintaining aspect ratio
-        pic = slide.shapes.add_picture(str(img_path), left=side_margin, top=top_margin)
-        # Original image size in EMU
-        orig_w = pic.image.size[0]
-        orig_h = pic.image.size[1]
-        # Compute scale to fit into (avail_w, avail_h)
-        scale_w = avail_w / orig_w
-        scale_h = avail_h / orig_h
-        scale = min(scale_w, scale_h)
-        new_w = int(orig_w * scale)
-        new_h = int(orig_h * scale)
-        pic.width = new_w
-        pic.height = new_h
-        # Center horizontally within available width; keep anchored to top
-        pic.left = int((slide_w - new_w) / 2)
-        pic.top = top_margin  # anchored at top
-
-        # Bottom text box with the title
-        tx_left = Inches(0)
-        tx_top = slide_h - bottom_band_h
-        tx_width = slide_w
-        tx_height = bottom_band_h
-        textbox = slide.shapes.add_textbox(tx_left, tx_top, tx_width, tx_height)
-        tf = textbox.text_frame
-        tf.clear()
-        # Center text vertically and horizontally within the band
-        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-        p = tf.paragraphs[0]
-        p.alignment = PP_ALIGN.CENTER
-        run = p.add_run()
-        run.text = title
-        font = run.font
-        font.size = Pt(20)
-        # Default color is black; leave as black.
-
+            tx_box = slide.shapes.add_textbox(0, slide_h - bottom_band_h, slide_w, bottom_band_h)
+            tf = tx_box.text_frame
+            tf.clear()
+            tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+            p = tf.paragraphs[0]
+            p.alignment = PP_ALIGN.CENTER
+            run = p.add_run()
+            run.text = title
+            font = run.font
+            font.size = Pt(22)
+            font.bold = True
+        except Exception as e:
+            print(f"ERRORE: Impossibile aggiungere l'immagine '{img_path.name}': {e}")
     prs.save(str(ppt_path))
 
-def _extract_author_from_path(path: Path):
-    stem = path.stem
-    parts = stem.split("_")
-    title_tokens: list[str] = []
-    # Find first numeric token position
-    idx = None
-    for i, tok in enumerate(parts):
-        if tok.isdigit():
-            idx = i
-            break
-    if idx is not None and idx + 1 < len(parts):
-        title_tokens = parts[:idx]
-    else:
-        title_tokens = parts
-    raw = " ".join(title_tokens).strip()
-    raw = raw.replace("  ", " ")
-    raw = raw.lower()
-    if raw:
-        return raw[0].upper() + raw[1:]
-    return stem.replace("_", " ")
 
-def _build_leaderboard_ppt(ppt_path: Path, title_path_pairs: list[tuple[str, Path]]) -> None:
-    if Presentation is None:
-        print("python-pptx non è installato: salto la generazione della presentazione.")
-        print("Per abilitarla: pip install python-pptx")
-        return
-
+def _build_leaderboard_ppt(ppt_path: Path, ranked_entries: list[tuple[int, str, Path]]) -> None:
+    if Presentation is None: return
     prs = Presentation()
-    # Ensure a white background (default is white; keep as is).
-    blank_layout = prs.slide_layouts[6]  # blank
+    blank_layout = prs.slide_layouts[6]
+    slide_w, slide_h = prs.slide_width, prs.slide_height
 
-    # Dimensions
-    slide_w = prs.slide_width
-    slide_h = prs.slide_height
-
-    for title, img_path in title_path_pairs:
+    for rank, title, img_path in ranked_entries:
         title_slide = prs.slides.add_slide(blank_layout)
-
-        textbox = title_slide.shapes.add_textbox(0, 0, slide_w, slide_h)
-        tf = textbox.text_frame
+        tx_box = title_slide.shapes.add_textbox(Inches(0.5), Inches(0.5), slide_w - Inches(1), slide_h - Inches(1))
+        tf = tx_box.text_frame
         tf.clear()
-
         tf.vertical_anchor = MSO_ANCHOR.MIDDLE
 
-        p1 = tf.paragraphs[0]
-        p1.alignment = PP_ALIGN.CENTER
-        run1 = p1.add_run()
-        run1.text = title
-        font = run1.font
-        font.size = Pt(44)
-        font.bold = True
+        author, _ = _parse_filename(img_path)
 
-        p2 = tf.add_paragraph()
-        p2.alignment = PP_ALIGN.CENTER
-        run2 = p2.add_run()
-        run2.text = _extract_author_from_path(img_path)
-        font2 = run2.font
-        font2.size = Pt(28)
-        font2.bold = False
+        p_pos = tf.paragraphs[0]
+        p_pos.alignment = PP_ALIGN.CENTER
+        run_pos = p_pos.add_run()
+        run_pos.text = f"{rank}° Classificato"
+        run_pos.font.size, run_pos.font.bold = Pt(54), True
+
+        p_title = tf.add_paragraph()
+        p_title.alignment = PP_ALIGN.CENTER
+        run_title = p_title.add_run()
+        run_title.text = title
+        run_title.font.size = Pt(32)
+
+        p_author = tf.add_paragraph()
+        p_author.alignment = PP_ALIGN.CENTER
+        run_author = p_author.add_run()
+        run_author.text = f"di {author}"
+        run_author.font.size, run_author.font.italic = Pt(24), True
 
         img_slide = prs.slides.add_slide(blank_layout)
-
-        # Add picture roughly sized, then adjust to fit maintaining aspect ratio
-        pic = img_slide.shapes.add_picture(str(img_path), 0, 0)
-
-        img_w, img_h = pic.image.size
-
-        scale = slide_h / img_h
-
-        new_w = int(img_w * scale)
-        new_h = slide_h
-
-        pic.width = new_w
-        pic.height = new_h
-
-        pic.left = int((slide_w - new_w) / 2)
-        pic.top = 0
-
+        try:
+            pic = img_slide.shapes.add_picture(str(img_path), 0, 0)
+            img_w, img_h = pic.image.size
+            scale = min(slide_w / img_w, slide_h / img_h)
+            new_w, new_h = int(img_w * scale), int(img_h * scale)
+            pic.width, pic.height = new_w, new_h
+            pic.left, pic.top = int((slide_w - new_w) / 2), int((slide_h - new_h) / 2)
+        except Exception as e:
+            print(f"ERRORE: Impossibile aggiungere l'immagine '{img_path.name}': {e}")
     prs.save(str(ppt_path))
 
+
 def _find_judge_csvs(judges_dir: Path) -> list[Path]:
-    csvs: list[Path] = []
-    if not judges_dir.exists():
-        return csvs
-    for d in judges_dir.iterdir():
-        if d.is_dir():
-            for f in d.iterdir():
-                if f.is_file() and f.suffix.lower() == ".csv":
-                    csvs.append(f)
-    return csvs
+    if not judges_dir.exists(): return []
+    return [f for d in judges_dir.iterdir() if d.is_dir() for f in d.iterdir() if
+            f.is_file() and f.suffix.lower() == ".csv"]
 
 
-def _generate_leaderboard(base: Path, master_csv: Path) -> None:
-    """Generate leaderboard/classifica.csv based on judge CSVs.
-    Uses criteria and titles from the consolidated spreadsheet CSV.
-    """
-    leaderboard_dir = base / "leaderboard"
-    leaderboard_dir.mkdir(parents=True, exist_ok=True)
-
+def _generate_leaderboard_logic(base: Path, master_csv: Path) -> None:
     judges_dir = base / "judges"
+    all_juror_dirs = [d for d in judges_dir.iterdir() if d.is_dir()]
     judge_csvs = _find_judge_csvs(judges_dir)
-    if not judge_csvs:
-        return  # nothing to do
+    submitted_jurors = {p.parent.name for p in judge_csvs}
+    missing_jurors = [d.name for d in all_juror_dirs if d.name not in submitted_jurors]
+
+    print("\nGenerazione classifica in corso...")
+    if missing_jurors:
+        print(f"⚠️  ATTENZIONE: Trovati i file di {len(submitted_jurors)} giurati su {len(all_juror_dirs)}.")
+        print(f"   Mancano i voti di: {', '.join(missing_jurors)}")
+        if not _confirm_or_exit("Generare classifica con dati parziali?", default=False):
+            print("Generazione classifica annullata.");
+            return
 
     criteria = _read_existing_criteria(master_csv)
     titles = _read_existing_titles(master_csv)
-    if not criteria or not titles:
-        return  # cannot build without structure
-
-    from collections import defaultdict
-
-    values: dict[tuple[str, str], list[float]] = defaultdict(list)  # (title, criterion) -> list of floats
+    values: dict[tuple[str, str], list[float]] = defaultdict(list)
 
     for jcsv in judge_csvs:
         try:
-            with jcsv.open("r", encoding="utf-8", newline="") as f:
+            with jcsv.open("r", encoding="utf-8-sig", newline="") as f:
                 reader = csv.reader(f)
                 header = next(reader, [])
-                # Map criterion name -> column index in this judge CSV
-                crit_to_idx: dict[str, int] = {}
-                for idx, name in enumerate(header[1:], start=1):
-                    if name:
-                        crit_to_idx[name] = idx
-                seen_titles: set[str] = set()
+                crit_to_idx = {name: idx for idx, name in enumerate(header[1:], start=1) if name}
                 for row in reader:
-                    if not row:
-                        continue
-                    title = row[0]
-                    if title not in titles:
-                        # Skip unknown titles silently
-                        continue
-                    seen_titles.add(title)
+                    if not row: continue
+                    title, s_val = row[0], ""
+                    if title not in titles: continue
                     for crit in criteria:
                         col = crit_to_idx.get(crit)
-                        if col is None:
-                            print(f"Voto mancante per titolo '{title}' criterio '{crit}' per il giudice '"
-                                  f"{jcsv.parent.name}' ("
-                                  f"colonna "
-                                  f"assente)")
-                            continue
-                        cell = row[col] if col < len(row) else ""
-                        if cell is None or str(cell).strip() == "":
-                            print(f"Voto mancante per titolo '{title}' criterio '{crit}' per il giudice '"
-                                  f"{jcsv.parent.name}'")
-                            continue
-                        s = str(cell).strip().replace(",", ".")
-                        try:
-                            num = float(s)
-                        except Exception:
-                            print(f"Voto non valido '{cell}' per titolo '{title}' criterio '{crit}' per il giudice '"
-                                  f"{jcsv.parent.name}'")
-                            continue
-                        values[(title, crit)].append(num)
-                # For titles not present at all in this judge CSV, count as missing per-criterion
-                missing_titles = [t for t in titles if t not in seen_titles]
-                for mt in missing_titles:
-                    for crit in criteria:
-                        print(f"Voto mancante per titolo '{mt}' criterio '{crit}' per il giudice '{jcsv.parent.name}' ("
-                              f"titolo assente)")
+                        if col is not None and col < len(row) and row[col].strip():
+                            try:
+                                s_val = row[col].strip().replace(",", ".")
+                                values[(title, crit)].append(float(s_val))
+                            except ValueError:
+                                print(f"AVVISO: Voto non valido ('{s_val}') in {jcsv.parent.name}")
         except Exception as e:
-            print(f"Impossibile leggere il file dei voti '{jcsv}': {e}")
-            continue
+            print(f"ERRORE: Impossibile leggere '{jcsv}': {e}")
 
-    # Build leaderboard rows
-    out_rows: list[list[str]] = []
-    header = [""] + criteria + ["Totale", "Top10"]
-    out_rows.append(header)
-
-    scored: list[tuple[str, list[str], float]] = []  # (title, cells, total)
+    header = ["Posizione", "Titolo"] + criteria + ["Media Totale"]
+    scored = []
     for title in titles:
-        row_cells: list[str] = []
-        criterion_means: list[float] = []
-        for crit in criteria:
-            nums = values.get((title, crit), [])
-            if nums:
-                avg = sum(nums) / len(nums)
-                criterion_means.append(avg)
-                row_cells.append(f"{avg:.3f}")
-            else:
-                row_cells.append("")
-        if criterion_means:
-            total = sum(criterion_means) / len(criterion_means)
-        else:
-            total = float('-inf')  # mark as missing for sorting; will render as blank
-        scored.append((title, row_cells, total))
+        criterion_means = [sum(v) / len(v) for c in criteria if (v := values.get((title, c)))]
+        final_score = sum(criterion_means) / len(criterion_means) if criterion_means else -1.0
+        row_cells = [f"{(sum(v) / len(v)):.2f}" if (v := values.get((title, c))) else "" for c in criteria]
+        scored.append((title, row_cells, final_score))
 
-    # Sort by Totale desc
-    scored.sort(key=lambda x: x[2], reverse=True)
+    scored.sort(key=lambda x: (-x[2], x[0]))
 
-    # Emit rows; render -inf as blank
-    for idx, (title, cells, total) in enumerate(scored, start=1):
-        total_str = "" if total == float('-inf') else f"{total:.3f}"
-        out_rows.append([title] + cells + [total_str])
+    out_rows = [header]
+    rank, last_score = 0, float('inf')
+    for i, (title, cells, total) in enumerate(scored):
+        if total < last_score: rank, last_score = i + 1, total
+        out_rows.append([str(rank), title] + cells + [f"{total:.2f}" if total >= 0 else "N/D"])
 
+    leaderboard_dir = base / "leaderboard"
     leaderboard_csv = leaderboard_dir / "classifica.csv"
-    try:
-        with leaderboard_csv.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerows(out_rows)
-        # We keep prints minimal; creation is implicit.
-    except Exception as e:
-        print(f"Errore nella scrittura della leaderboard '{leaderboard_csv}': {e}")
-    # Create pptx leaderboard if possible by taking top 10 images
-    if Presentation is not None:
-        top10 = [title for (title, _cells, total) in scored if total != float('-inf')][:10]
-        if top10:
-            title_path_map = {}
-            for p in (base / "pictures").iterdir():
-                if p.is_file() and p.suffix.lower() in {'.jpg', '.jpeg'}:
-                    extracted_title = _extract_title_from_filename(p)
-                    title_path_map[extracted_title] = p
-            top10_pairs = [(t, title_path_map[t]) for t in top10 if t in title_path_map]
-            if top10_pairs:
-                ppt_leaderboard_path = leaderboard_dir / "classifica.pptx"
-                _build_leaderboard_ppt(ppt_leaderboard_path, top10_pairs)
-    else:
-        print("python-pptx non è installato: salto la generazione della presentazione della classifica.")
-        print("Per abilitarla: pip install python-pptx")
+    with leaderboard_csv.open("w", encoding="utf-8", newline="") as f:
+        csv.writer(f).writerows(out_rows)
+    print(f"✅ Classifica CSV salvata in: {leaderboard_csv.name}")
+
+    winners_data = [s for s in scored if s[2] >= 0]
+    if winners_data:
+        unique_scores = sorted(list(set(s[2] for s in winners_data)), reverse=True)
+        cutoff_score = unique_scores[min(9, len(unique_scores) - 1)] if unique_scores else -1.0
+
+        ppt_entries = []
+        pictures_dir = base / "pictures"
+        title_path_map = {_parse_filename(p)[1]: p for p in pictures_dir.iterdir() if p.is_file()}
+        rank, last_score = 0, float('inf')
+
+        for i, (s_title, _, s_score) in enumerate(s for s in scored if s[2] >= cutoff_score):
+            if s_score < last_score: rank, last_score = i + 1, s_score
+            if s_title in title_path_map:
+                ppt_entries.append((rank, s_title, title_path_map[s_title]))
+
+        if ppt_entries:
+            ppt_path = leaderboard_dir / "classifica.pptx"
+            _build_leaderboard_ppt(ppt_path, ppt_entries)
+            print(f"✅ Presentazione classifica salvata in: {ppt_path.name}")
+
+
+# --- FUNZIONE MAIN ---
+
+def main() -> None:
+    print("---" * 15)
+    print("   Benvenuto nello strumento di gestione concorsi fotografici!   ")
+    print("---" * 15)
+
+    root_dir = Path.cwd() / "Concorsi Orizzonti Fotografici"
+    root_dir.mkdir(exist_ok=True)
+
+    contest_selection = _select_or_create_contest(root_dir)
+    if not contest_selection:
+        print("Nessun concorso selezionato. Uscita.");
+        return
+    base, folder_name = contest_selection
+
+    if not base.exists():
+        base.mkdir(parents=True)
+        print(f"\n✅ Creata nuova cartella per il concorso: '{base.name}'")
+
+    for sub in ["pictures", "presentations", "spreadsheet", "leaderboard", "judges"]:
+        (base / sub).mkdir(exist_ok=True)
+
+    while True:
+        _display_contest_status(base, folder_name)
+
+        choices = {
+            "sync": "🔄 Sincronizza foto/criteri",
+            "jurors": "🛠️  Gestisci Giurati",
+            "deadline": "✏️ Modifica data di scadenza",
+            "leaderboard": "🏆 Genera Classifica Finale",
+            "open": "📂 Apri la cartella del concorso",
+            "exit": "🚪 Esci"
+        }
+
+        if inquirer:
+            q = [inquirer.List('action', message="Menu Principale", choices=list(choices.values()), carousel=True)]
+            answers = inquirer.prompt(q)
+            if not answers: break
+            chosen_value = answers['action']
+            chosen_key = next(key for key, value in choices.items() if value == chosen_value)
+        else:
+            choice_map = list(choices.keys())
+            for i, key in enumerate(choice_map, 1): print(f"  [{i}] {choices[key]}")
+            while True:
+                try:
+                    num = int(_input_or_exit("Scegli un'azione: "))
+                    if 1 <= num <= len(choice_map):
+                        chosen_key = choice_map[num - 1];
+                        break
+                    else:
+                        print("Scelta non valida.")
+                except ValueError:
+                    print("Inserisci un numero.")
+
+        if chosen_key == "sync":
+            _action_sync_files(base, folder_name)
+        elif chosen_key == "jurors":
+            _action_manage_jurors(base / "judges")
+        elif chosen_key == "deadline":
+            _action_edit_deadline(root_dir, folder_name)
+        elif chosen_key == "leaderboard":
+            _action_generate_leaderboard(base, folder_name)
+        elif chosen_key == "open":
+            _open_folder(base)
+        elif chosen_key == "exit":
+            break
+
+    print("\nGrazie per aver usato lo strumento. Arrivederci! 👋")
+
 
 if __name__ == "__main__":
+    if Presentation is None:
+        print("AVVISO: `python-pptx` non installato, funzionalità di presentazione disabilitate.")
+        print("Per abilitarli, esegui: pip install python-pptx\n")
+    if inquirer is None:
+        print("AVVISO: `inquirer` non installato o non sei in un terminale interattivo.")
+        print("Verrà usata un'interfaccia a menu numerico.\n")
+
     main()
