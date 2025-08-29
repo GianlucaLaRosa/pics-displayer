@@ -11,6 +11,18 @@ import json
 from pathlib import Path
 from collections import defaultdict
 
+# --- Gestione codifica su Windows ---
+if sys.platform == 'win32':
+    try:
+        # Tenta di cambiare la codifica del terminale per supportare UTF-8
+        import subprocess
+
+        subprocess.run(['chcp', '65001'], check=True, capture_output=True, text=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    except FileNotFoundError:
+        # chcp potrebbe non essere disponibile o non riuscire
+        pass
+
 # --- IMPOSTAZIONE SEPARATORE ---
 FILENAME_SEPARATOR = "--"
 
@@ -277,33 +289,75 @@ def _action_manage_jurors(judges_dir: Path):
                     print(f"✅ Creata cartella per: {safe_name}")
 
         elif "Rinomina" in action:
-            if not inquirer:
-                print("Funzione disponibile solo in modalità interattiva.")
+            if not jurors:
+                print("Nessun giurato da rinominare.")
                 continue
-            q = [inquirer.List('old_name', message="Quale giurato vuoi rinominare?", choices=jurors)]
-            answers = inquirer.prompt(q)
-            if not answers: continue
-            old_name = answers['old_name']
-            new_name_raw = _input_or_exit(f"Nuovo nome per '{old_name}': ").strip()
-            if new_name_raw:
-                new_name = _sanitize_name(new_name_raw)
-                if (judges_dir / new_name).exists():
-                    print(f"ERRORE: Esiste già un giurato di nome '{new_name}'.")
-                else:
-                    (judges_dir / old_name).rename(judges_dir / new_name)
-                    print(f"✅ '{old_name}' rinominato in '{new_name}'.")
+
+            old_name = ""
+            if inquirer:
+                q = [inquirer.List('old_name', message="Quale giurato vuoi rinominare?", choices=jurors)]
+                answers = inquirer.prompt(q)
+                if answers:
+                    old_name = answers['old_name']
+            else:
+                print("\nGiurati esistenti:")
+                for i, name in enumerate(jurors, 1):
+                    print(f"  [{i}] {name}")
+
+                while True:
+                    try:
+                        choice_idx = int(_input_or_exit("Numero del giurato da rinominare: ")) - 1
+                        if 0 <= choice_idx < len(jurors):
+                            old_name = jurors[choice_idx]
+                            break
+                        else:
+                            print("Scelta non valida.")
+                    except (ValueError, IndexError):
+                        print("Inserisci un numero valido.")
+
+            if old_name:
+                new_name_raw = _input_or_exit(f"Nuovo nome per '{old_name}': ").strip()
+                if new_name_raw:
+                    new_name = _sanitize_name(new_name_raw)
+                    if (judges_dir / new_name).exists():
+                        print(f"ERRORE: Esiste già un giurato di nome '{new_name}'.")
+                    else:
+                        (judges_dir / old_name).rename(judges_dir / new_name)
+                        print(f"✅ '{old_name}' rinominato in '{new_name}'.")
 
         elif "Elimina" in action:
-            if not inquirer:
-                print("Funzione disponibile solo in modalità interattiva.")
+            if not jurors:
+                print("Nessun giurato da eliminare.")
                 continue
-            q = [inquirer.List('del_name', message="Quale giurato vuoi eliminare?", choices=jurors)]
-            answers = inquirer.prompt(q)
-            if not answers: continue
-            name_to_delete = answers['del_name']
-            if _confirm_or_exit(f"Sei sicuro di voler eliminare '{name_to_delete}' e i suoi voti?", default=False):
-                shutil.rmtree(judges_dir / name_to_delete)
-                print(f"🗑️  Giurato '{name_to_delete}' eliminato.")
+
+            name_to_delete = ""
+            if inquirer:
+                q = [inquirer.List('del_name', message="Quale giurato vuoi eliminare?", choices=jurors)]
+                answers = inquirer.prompt(q)
+                if answers:
+                    name_to_delete = answers['del_name']
+            else:
+                print("\nGiurati esistenti:")
+                for i, name in enumerate(jurors, 1):
+                    print(f"  [{i}] {name}")
+
+                while True:
+                    try:
+                        choice_idx = int(_input_or_exit("Numero del giurato da eliminare: ")) - 1
+                        if 0 <= choice_idx < len(jurors):
+                            name_to_delete = jurors[choice_idx]
+                            break
+                        else:
+                            print("Scelta non valida.")
+                    except (ValueError, IndexError):
+                        print("Inserisci un numero valido.")
+
+            if name_to_delete:
+                if _confirm_or_exit(f"Sei sicuro di voler eliminare '{name_to_delete}' e i suoi voti?", default=False):
+                    shutil.rmtree(judges_dir / name_to_delete)
+                    print(f"🗑️  Giurato '{name_to_delete}' eliminato.")
+                else:
+                    print("Operazione annullata.")
 
         elif "Torna" in action:
             break
@@ -745,12 +799,12 @@ def main() -> None:
         _display_contest_status(base, folder_name)
 
         choices = {
-            "sync": "🔄 Sincronizza foto/criteri",
+            "sync": "🔄  Sincronizza foto/criteri",
             "jurors": "🛠️  Gestisci Giurati",
-            "deadline": "✏️ Modifica data di scadenza",
-            "leaderboard": "🏆 Genera Classifica Finale",
-            "open": "📂 Apri la cartella del concorso",
-            "exit": "🚪 Esci"
+            "deadline": "✏️  Modifica data di scadenza",
+            "leaderboard": "🏆  Genera Classifica Finale",
+            "open": "📂  Apri la cartella del concorso",
+            "exit": "🚪  Esci"
         }
 
         if inquirer:
