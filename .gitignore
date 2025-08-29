@@ -1,3 +1,21 @@
-.idea
-.build
-.dist
+# PyCharm
+.idea/
+*.iml
+.DS_Store
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Python cache and temporary files
+__pycache__/
+*.pyc
+*.pyo
+*~
+*.log
+
+# PyInstaller files
+build/
+dist/
+*.spec
