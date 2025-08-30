@@ -161,8 +161,17 @@ def _update_contest_in_log(log_path: Path, contest_name: str, deadline: str | No
 def _read_existing_criteria(csv_path: Path) -> list[str]:
     if not csv_path.exists(): return []
     try:
-        with csv_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.reader(f)
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+            first_line = f.readline()
+            f.seek(0)
+            sniffer = csv.Sniffer()
+            try:
+                dialect = sniffer.sniff(first_line, delimiters=',;')
+                reader = csv.reader(f, dialect)
+            except csv.Error:
+                f.seek(0)
+                reader = csv.reader(f, delimiter=';')
+
             return [c for c in next(reader, [])[1:] if c]
     except Exception:
         return []
@@ -172,8 +181,17 @@ def _read_existing_titles(csv_path: Path) -> list[str]:
     if not csv_path.exists(): return []
     titles = []
     try:
-        with csv_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.reader(f)
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+            first_line = f.readline()
+            f.seek(0)
+            sniffer = csv.Sniffer()
+            try:
+                dialect = sniffer.sniff(first_line, delimiters=',;')
+                reader = csv.reader(f, dialect)
+            except csv.Error:
+                f.seek(0)
+                reader = csv.reader(f, delimiter=';')
+
             next(reader, None)
             for row in reader:
                 if row: titles.append(row[0])
@@ -185,13 +203,13 @@ def _read_existing_titles(csv_path: Path) -> list[str]:
 def _write_consolidated_csv(csv_path: Path, criteria: list[str], titles: list[str]) -> None:
     header = [""] + criteria
     rows = [header] + [[t] + [""] * len(criteria) for t in titles]
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+        f.write('sep=;\n')
+        writer = csv.writer(f, delimiter=';')
         writer.writerows(rows)
 
 
 def _normalize_string(text: str) -> str:
-    text = re.sub(r'(?<!^)(?=[A-Z])', ' ', text)
     text = text.replace('_', ' ').replace('-', ' ')
     return ' '.join(text.split()).strip()
 
@@ -208,8 +226,11 @@ def _parse_filename(path: Path) -> tuple[str, str]:
             raw_author, raw_title = stem[:match.start()], stem[match.end():]
         else:
             raw_title = stem
+
     author = _normalize_string(raw_author).title()
-    title = _normalize_string(raw_title).capitalize()
+    normalized_title = _normalize_string(raw_title)
+    title = normalized_title[0].upper() + normalized_title[1:] if normalized_title else ""
+
     return author or "Autore Sconosciuto", title or "Titolo Sconosciuto"
 
 
@@ -218,8 +239,8 @@ def _parse_filename(path: Path) -> tuple[str, str]:
 def _display_contest_status(base: Path, folder_name: str):
     pictures_path = base / "pictures"
     judges_dir = base / "judges"
-    spreadsheet_dir = base / "spreadsheet"
-    csv_path = spreadsheet_dir / f"{_make_snake(folder_name)} giuria.csv"
+    jury_kit_dir = base / "jury_kit"
+    csv_path = jury_kit_dir / f"{_make_snake(folder_name)} giuria.csv"
     log_path = _get_log_path(base.parent)
     log_data = _read_log(log_path)
 
@@ -369,8 +390,8 @@ def _action_sync_files(base: Path, folder_name: str):
     photo_paths = [p for p in pictures_path.iterdir() if p.is_file() and p.suffix.lower() in {'.jpg', '.jpeg'}]
     photos_exist = bool(photo_paths)
 
-    spreadsheet_dir = base / "spreadsheet"
-    csv_path = spreadsheet_dir / f"{_make_snake(folder_name)} giuria.csv"
+    jury_kit_dir = base / "jury_kit"
+    csv_path = jury_kit_dir / f"{_make_snake(folder_name)} giuria.csv"
 
     existing_criteria = _read_existing_criteria(csv_path)
     print("\nCriteri attuali:", ", ".join(existing_criteria) if existing_criteria else "Nessuno")
@@ -409,15 +430,21 @@ def _action_sync_files(base: Path, folder_name: str):
         if photos_changed and photos_exist: random.shuffle(titles_for_csv)
 
         _write_consolidated_csv(csv_path, final_criteria, titles_for_csv)
-        print(f"✅ File '{csv_path.name}' aggiornato.")
+        print(f"✅ File '{csv_path.name}' aggiornato in 'jury_kit'.")
 
         if photos_exist:
-            presentations_dir = base / "presentations"
-            ppt_path = presentations_dir / f"{_make_snake(folder_name)}.pptx"
+            ppt_path = jury_kit_dir / f"{_make_snake(folder_name)}.pptx"
             parsed_photos = {_parse_filename(p)[1]: p for p in photo_paths}
             ordered_pairs = [(t, parsed_photos[t]) for t in titles_for_csv if t in parsed_photos]
+
             _build_ppt(ppt_path, ordered_pairs)
-            print(f"✅ Presentazione '{ppt_path.name}' aggiornata.")
+            print(f"✅ Presentazione '{ppt_path.name}' aggiornata in 'jury_kit'.")
+
+            _update_original_pictures_folder(jury_kit_dir, ordered_pairs)
+
+            # --- NUOVA FUNZIONALITÀ: Creazione Archivio ZIP ---
+            archive_base_path = base / f"{_make_snake(folder_name)}_jury_kit"
+            _create_jury_kit_zip(jury_kit_dir, archive_base_path)
     else:
         print("❌ Operazione annullata.")
 
@@ -428,8 +455,8 @@ def _action_generate_leaderboard(base: Path, folder_name: str):
     print("\n### 🏆 Generazione Classifica Finale ###")
     pictures_path = base / "pictures"
     judges_dir = base / "judges"
-    spreadsheet_dir = base / "spreadsheet"
-    csv_path = spreadsheet_dir / f"{_make_snake(folder_name)} giuria.csv"
+    jury_kit_dir = base / "jury_kit"
+    csv_path = jury_kit_dir / f"{_make_snake(folder_name)} giuria.csv"
 
     photo_paths = [p for p in pictures_path.iterdir() if p.is_file()]
     criteria = _read_existing_criteria(csv_path)
@@ -600,6 +627,42 @@ def _collect_criteria_from(placeholders: list[str]) -> list[str]:
     return criteria
 
 
+def _update_original_pictures_folder(jury_kit_dir: Path, title_path_pairs: list[tuple[str, Path]]):
+    """Crea/aggiorna la cartella 'original_pictures' dentro a 'jury_kit' con le foto del concorso."""
+    original_pictures_dir = jury_kit_dir / "original_pictures"
+
+    if original_pictures_dir.exists():
+        shutil.rmtree(original_pictures_dir)
+    original_pictures_dir.mkdir(exist_ok=True)
+
+    copied_count = 0
+    for title, original_path in title_path_pairs:
+        safe_title = _sanitize_name(title)
+        new_filename = f"{safe_title}{original_path.suffix}"
+        destination_path = original_pictures_dir / new_filename
+
+        try:
+            shutil.copy(original_path, destination_path)
+            copied_count += 1
+        except Exception as e:
+            print(f"ERRORE: Impossibile copiare '{original_path.name}' in '{destination_path}': {e}")
+
+    print(f"✅ Cartella 'original_pictures' aggiornata con {copied_count} foto.")
+
+
+def _create_jury_kit_zip(jury_kit_dir: Path, archive_base_name: Path):
+    """Crea un archivio ZIP della cartella jury_kit."""
+    try:
+        shutil.make_archive(
+            base_name=str(archive_base_name),
+            format='zip',
+            root_dir=jury_kit_dir
+        )
+        print(f"✅ Creato archivio ZIP: '{archive_base_name.name}.zip'")
+    except Exception as e:
+        print(f"ERRORE: Impossibile creare l'archivio ZIP: {e}")
+
+
 # --- LOGICA DI GENERAZIONE (PPT E CLASSIFICA) ---
 def _build_ppt(ppt_path: Path, title_path_pairs: list[tuple[str, Path]]) -> None:
     if Presentation is None:
@@ -711,7 +774,7 @@ def _generate_leaderboard_logic(base: Path, master_csv: Path) -> None:
     for jcsv in judge_csvs:
         try:
             with jcsv.open("r", encoding="utf-8-sig", newline="") as f:
-                reader = csv.reader(f)
+                reader = csv.reader(f, delimiter=';')
                 header = next(reader, [])
                 crit_to_idx = {name: idx for idx, name in enumerate(header[1:], start=1) if name}
                 for row in reader:
@@ -747,8 +810,9 @@ def _generate_leaderboard_logic(base: Path, master_csv: Path) -> None:
 
     leaderboard_dir = base / "leaderboard"
     leaderboard_csv = leaderboard_dir / "classifica.csv"
-    with leaderboard_csv.open("w", encoding="utf-8", newline="") as f:
-        csv.writer(f).writerows(out_rows)
+    with leaderboard_csv.open("w", encoding="utf-8-sig", newline="") as f:
+        f.write('sep=;\n')
+        csv.writer(f, delimiter=';').writerows(out_rows)
     print(f"✅ Classifica CSV salvata in: {leaderboard_csv.name}")
 
     winners_data = [s for s in scored if s[2] >= 0]
@@ -792,14 +856,14 @@ def main() -> None:
         base.mkdir(parents=True)
         print(f"\n✅ Creata nuova cartella per il concorso: '{base.name}'")
 
-    for sub in ["pictures", "presentations", "spreadsheet", "leaderboard", "judges"]:
+    for sub in ["pictures", "jury_kit", "leaderboard", "judges"]:
         (base / sub).mkdir(exist_ok=True)
 
     while True:
         _display_contest_status(base, folder_name)
 
         choices = {
-            "sync": "🔄  Sincronizza foto/criteri",
+            "sync": "🔄  Sincronizza e Crea/Aggiorna Jury Kit",
             "jurors": "🛠️  Gestisci Giurati",
             "deadline": "✏️  Modifica data di scadenza",
             "leaderboard": "🏆  Genera Classifica Finale",
