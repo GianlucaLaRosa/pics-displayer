@@ -143,7 +143,8 @@ def _write_log(log_path: Path, data: dict) -> None:
         json.dump(data, f, indent=2)
     if os.name == 'nt':
         try:
-            subprocess.run(['attrib', '+H', str(log_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(['attrib', '+H', str(log_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
         except (subprocess.CalledProcessError, FileNotFoundError):
             pass
 
@@ -163,13 +164,20 @@ def _read_existing_criteria(csv_path: Path) -> list[str]:
     try:
         with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
             first_line = f.readline()
+            if first_line.startswith('sep='):
+                first_line = f.readline()
             f.seek(0)
+            if f.readline().startswith('sep='):
+                pass
+
             sniffer = csv.Sniffer()
             try:
                 dialect = sniffer.sniff(first_line, delimiters=',;')
                 reader = csv.reader(f, dialect)
             except csv.Error:
                 f.seek(0)
+                if f.readline().startswith('sep='):
+                    pass
                 reader = csv.reader(f, delimiter=';')
 
             return [c for c in next(reader, [])[1:] if c]
@@ -183,13 +191,20 @@ def _read_existing_titles(csv_path: Path) -> list[str]:
     try:
         with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
             first_line = f.readline()
-            f.seek(0)
+            if not first_line.startswith('sep='):
+                f.seek(0)
+
             sniffer = csv.Sniffer()
             try:
-                dialect = sniffer.sniff(first_line, delimiters=',;')
+                sample = f.readline()
+                f.seek(0)
+                if f.readline().startswith('sep='): pass
+
+                dialect = sniffer.sniff(sample, delimiters=',;')
                 reader = csv.reader(f, dialect)
             except csv.Error:
                 f.seek(0)
+                if f.readline().startswith('sep='): pass
                 reader = csv.reader(f, delimiter=';')
 
             next(reader, None)
@@ -396,8 +411,8 @@ def _action_sync_files(base: Path, folder_name: str):
     existing_criteria = _read_existing_criteria(csv_path)
     print("\nCriteri attuali:", ", ".join(existing_criteria) if existing_criteria else "Nessuno")
     if _confirm_or_exit("Vuoi modificare i criteri?", default=not existing_criteria):
-        final_criteria = _collect_criteria_from(
-            existing_criteria or ["Attinenza al tema", "Tecnica", "Creatività", "Impressione generale"])
+        placeholders = existing_criteria or ["Attinenza al tema", "Tecnica", "Creatività", "Impressione generale"]
+        final_criteria = _collect_criteria_from(placeholders)
     else:
         final_criteria = existing_criteria
     criteria_changed = final_criteria != existing_criteria
@@ -442,9 +457,9 @@ def _action_sync_files(base: Path, folder_name: str):
 
             _update_original_pictures_folder(jury_kit_dir, ordered_pairs)
 
-            # --- NUOVA FUNZIONALITÀ: Creazione Archivio ZIP ---
-            archive_base_path = base / f"{_make_snake(folder_name)}_jury_kit"
-            _create_jury_kit_zip(jury_kit_dir, archive_base_path)
+        archive_base_path = base / f"{_make_snake(folder_name)}_jury_kit"
+        _create_jury_kit_zip(jury_kit_dir, archive_base_path)
+
     else:
         print("❌ Operazione annullata.")
 
@@ -453,6 +468,15 @@ def _action_sync_files(base: Path, folder_name: str):
 
 def _action_generate_leaderboard(base: Path, folder_name: str):
     print("\n### 🏆 Generazione Classifica Finale ###")
+
+    # --- CONTROLLO DI ROBUSTEZZA ---
+    # Controlla la presenza di python-pptx qui, prima di iniziare.
+    if Presentation is None:
+        print("\n❌ ERRORE: La libreria 'python-pptx' è necessaria per creare la presentazione.")
+        print("   Per installarla, esegui dal terminale: pip install python-pptx")
+        _input_or_exit("Premi Invio per tornare al menu...")
+        return
+
     pictures_path = base / "pictures"
     judges_dir = base / "judges"
     jury_kit_dir = base / "jury_kit"
@@ -653,12 +677,16 @@ def _update_original_pictures_folder(jury_kit_dir: Path, title_path_pairs: list[
 def _create_jury_kit_zip(jury_kit_dir: Path, archive_base_name: Path):
     """Crea un archivio ZIP della cartella jury_kit."""
     try:
+        zip_path = archive_base_name.parent / f"{archive_base_name.name}.zip"
+        if zip_path.exists():
+            os.remove(zip_path)
+
         shutil.make_archive(
             base_name=str(archive_base_name),
             format='zip',
             root_dir=jury_kit_dir
         )
-        print(f"✅ Creato archivio ZIP: '{archive_base_name.name}.zip'")
+        print(f"✅ Creato/Aggiornato archivio ZIP: '{archive_base_name.name}.zip'")
     except Exception as e:
         print(f"ERRORE: Impossibile creare l'archivio ZIP: {e}")
 
@@ -700,50 +728,73 @@ def _build_ppt(ppt_path: Path, title_path_pairs: list[tuple[str, Path]]) -> None
     prs.save(str(ppt_path))
 
 
-def _build_leaderboard_ppt(ppt_path: Path, ranked_entries: list[tuple[int, str, Path]]) -> None:
-    if Presentation is None: return
-    prs = Presentation()
-    blank_layout = prs.slide_layouts[6]
-    slide_w, slide_h = prs.slide_width, prs.slide_height
+def _build_leaderboard_ppt(ppt_path: Path, ranked_entries: list[tuple[int, str, Path]]) -> bool:
+    """Crea la presentazione PowerPoint e restituisce True in caso di successo, False altrimenti."""
+    if Presentation is None:
+        return False
 
-    for rank, title, img_path in ranked_entries:
-        title_slide = prs.slides.add_slide(blank_layout)
-        tx_box = title_slide.shapes.add_textbox(Inches(0.5), Inches(0.5), slide_w - Inches(1), slide_h - Inches(1))
-        tf = tx_box.text_frame
-        tf.clear()
-        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    try:
+        prs = Presentation()
+        blank_layout = prs.slide_layouts[6]
+        slide_w, slide_h = prs.slide_width, prs.slide_height
 
-        author, _ = _parse_filename(img_path)
+        for rank, title, img_path in ranked_entries:
+            # Slide con il testo
+            title_slide = prs.slides.add_slide(blank_layout)
+            tx_box = title_slide.shapes.add_textbox(Inches(0.5), Inches(0.5), slide_w - Inches(1), slide_h - Inches(1))
+            tf = tx_box.text_frame
+            tf.clear()
+            tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+            author, _ = _parse_filename(img_path)
 
-        p_pos = tf.paragraphs[0]
-        p_pos.alignment = PP_ALIGN.CENTER
-        run_pos = p_pos.add_run()
-        run_pos.text = f"{rank}° Classificato"
-        run_pos.font.size, run_pos.font.bold = Pt(54), True
+            p_pos = tf.paragraphs[0]
+            p_pos.alignment = PP_ALIGN.CENTER
+            run_pos = p_pos.add_run()
+            run_pos.text = f"{rank}° Classificato"
+            run_pos.font.size, run_pos.font.bold = Pt(54), True
 
-        p_title = tf.add_paragraph()
-        p_title.alignment = PP_ALIGN.CENTER
-        run_title = p_title.add_run()
-        run_title.text = title
-        run_title.font.size = Pt(32)
+            p_title = tf.add_paragraph()
+            p_title.alignment = PP_ALIGN.CENTER
+            run_title = p_title.add_run()
+            run_title.text = title
+            run_title.font.size = Pt(32)
 
-        p_author = tf.add_paragraph()
-        p_author.alignment = PP_ALIGN.CENTER
-        run_author = p_author.add_run()
-        run_author.text = f"di {author}"
-        run_author.font.size, run_author.font.italic = Pt(24), True
+            p_author = tf.add_paragraph()
+            p_author.alignment = PP_ALIGN.CENTER
+            run_author = p_author.add_run()
+            run_author.text = f"di {author}"
+            run_author.font.size, run_author.font.italic = Pt(24), True
 
-        img_slide = prs.slides.add_slide(blank_layout)
-        try:
-            pic = img_slide.shapes.add_picture(str(img_path), 0, 0)
-            img_w, img_h = pic.image.size
-            scale = min(slide_w / img_w, slide_h / img_h)
-            new_w, new_h = int(img_w * scale), int(img_h * scale)
-            pic.width, pic.height = new_w, new_h
-            pic.left, pic.top = int((slide_w - new_w) / 2), int((slide_h - new_h) / 2)
-        except Exception as e:
-            print(f"ERRORE: Impossibile aggiungere l'immagine '{img_path.name}': {e}")
-    prs.save(str(ppt_path))
+            # Slide con l'immagine
+            img_slide = prs.slides.add_slide(blank_layout)
+            try:
+                pic = img_slide.shapes.add_picture(str(img_path), 0, 0)
+                img_w, img_h = pic.image.size
+                scale = min(slide_w / img_w, slide_h / img_h)
+                new_w, new_h = int(img_w * scale), int(img_h * scale)
+                pic.width, pic.height = new_w, new_h
+                pic.left, pic.top = int((slide_w - new_w) / 2), int((slide_h - new_h) / 2)
+            except FileNotFoundError:
+                print(f"⚠️  AVVISO: File immagine non trovato per '{title}': {img_path}")
+                # Aggiunge un testo di errore sulla slide
+                err_box = img_slide.shapes.add_textbox(Inches(1), Inches(1), slide_w - Inches(2), slide_h - Inches(2))
+                err_tf = err_box.text_frame
+                err_tf.text = f"Immagine non trovata:\n{img_path.name}"
+                err_tf.paragraphs[0].alignment = PP_ALIGN.CENTER
+            except Exception as e:
+                print(f"ERRORE: Impossibile aggiungere l'immagine '{img_path.name}': {e}")
+
+        prs.save(str(ppt_path))
+        return True
+
+    except Exception as e:
+        print(f"\n❌ ERRORE CRITICO durante la creazione della presentazione PowerPoint: {e}")
+        if ppt_path.exists():
+            try:
+                os.remove(ppt_path)  # Tenta di pulire file corrotti
+            except OSError:
+                pass
+        return False
 
 
 def _find_judge_csvs(judges_dir: Path) -> list[Path]:
@@ -774,6 +825,10 @@ def _generate_leaderboard_logic(base: Path, master_csv: Path) -> None:
     for jcsv in judge_csvs:
         try:
             with jcsv.open("r", encoding="utf-8-sig", newline="") as f:
+                first_line = f.readline()
+                if not first_line.startswith('sep='):
+                    f.seek(0)
+
                 reader = csv.reader(f, delimiter=';')
                 header = next(reader, [])
                 crit_to_idx = {name: idx for idx, name in enumerate(header[1:], start=1) if name}
@@ -804,11 +859,15 @@ def _generate_leaderboard_logic(base: Path, master_csv: Path) -> None:
 
     out_rows = [header]
     rank, last_score = 0, float('inf')
-    for i, (title, cells, total) in enumerate(scored):
-        if total < last_score: rank, last_score = i + 1, total
-        out_rows.append([str(rank), title] + cells + [f"{total:.2f}" if total >= 0 else "N/D"])
+    for title, cells, total in scored:
+        if total < last_score:
+            rank += 1
+            last_score = total
+        rank_str = str(rank) if total >= 0 else "N/D"
+        out_rows.append([rank_str, title] + cells + [f"{total:.2f}" if total >= 0 else "N/D"])
 
     leaderboard_dir = base / "leaderboard"
+    leaderboard_dir.mkdir(exist_ok=True)
     leaderboard_csv = leaderboard_dir / "classifica.csv"
     with leaderboard_csv.open("w", encoding="utf-8-sig", newline="") as f:
         f.write('sep=;\n')
@@ -817,23 +876,40 @@ def _generate_leaderboard_logic(base: Path, master_csv: Path) -> None:
 
     winners_data = [s for s in scored if s[2] >= 0]
     if winners_data:
-        unique_scores = sorted(list(set(s[2] for s in winners_data)), reverse=True)
-        cutoff_score = unique_scores[min(9, len(unique_scores) - 1)] if unique_scores else -1.0
+        all_ranks = [int(row[0]) for row in out_rows[1:] if row[0].isdigit()]
+        if not all_ranks:
+            print("ℹ️ Nessun classificato con punteggio valido. Salto creazione presentazione.")
+            return
+
+        unique_ranks = sorted(list(set(all_ranks)))
+        rank_cutoff = unique_ranks[min(9, len(unique_ranks) - 1)]
 
         ppt_entries = []
         pictures_dir = base / "pictures"
         title_path_map = {_parse_filename(p)[1]: p for p in pictures_dir.iterdir() if p.is_file()}
-        rank, last_score = 0, float('inf')
 
-        for i, (s_title, _, s_score) in enumerate(s for s in scored if s[2] >= cutoff_score):
-            if s_score < last_score: rank, last_score = i + 1, s_score
-            if s_title in title_path_map:
-                ppt_entries.append((rank, s_title, title_path_map[s_title]))
+        for row in out_rows[1:]:
+            if not row[0].isdigit(): continue
+
+            current_rank = int(row[0])
+            if current_rank <= rank_cutoff:
+                s_title = row[1]
+                if s_title in title_path_map:
+                    ppt_entries.append((current_rank, s_title, title_path_map[s_title]))
+                else:
+                    print(
+                        f"⚠️  AVVISO: La foto '{s_title}' è in classifica ma non è stata trovata nella cartella 'pictures'.")
+            else:
+                break
 
         if ppt_entries:
+            ppt_entries.reverse()
             ppt_path = leaderboard_dir / "classifica.pptx"
-            _build_leaderboard_ppt(ppt_path, ppt_entries)
-            print(f"✅ Presentazione classifica salvata in: {ppt_path.name}")
+
+            if _build_leaderboard_ppt(ppt_path, ppt_entries):
+                print(f"✅ Presentazione classifica salvata in: {ppt_path.name}")
+        else:
+            print("ℹ️ Nessuna foto trovata per i primi classificati. Salto creazione presentazione.")
 
 
 # --- FUNZIONE MAIN ---
