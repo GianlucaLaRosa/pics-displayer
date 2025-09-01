@@ -24,6 +24,7 @@ if sys.platform == 'win32':
 # --- IMPOSTAZIONE SEPARATORE ---
 FILENAME_SEPARATOR = "--"
 
+# --- GESTIONE DIPENDENZE OPZIONALI ---
 try:
     if not sys.stdout.isatty():
         raise ImportError("Non è un terminale interattivo, fallback a input standard.")
@@ -37,6 +38,14 @@ try:
     from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 except ImportError:
     Presentation = None
+
+# Aggiunto import per Pillow per una gestione robusta delle immagini
+try:
+    from PIL import Image
+except ImportError:
+    print(
+        "AVVISO: La libreria Pillow non è installata (pip install Pillow). Le funzioni PPTX potrebbero non funzionare.")
+    Image = None
 
 
 # --- FUNZIONI DI UTILITÀ E INPUT ---
@@ -732,10 +741,23 @@ def _build_ppt(ppt_path: Path, title_path_pairs: list[tuple[str, Path]]) -> None
         for title, img_path in title_path_pairs:
             slide = prs.slides.add_slide(blank_layout)
             try:
+                # --- INIZIO CODICE CORRETTO E ROBUSTO ---
+                if Image is None:
+                    raise ImportError("La libreria Pillow non è installata, impossibile continuare.")
+
+                # 1. Apri l'immagine con Pillow per ottenere le dimensioni REALI
+                img_w, img_h = Image.open(img_path).size
+
+                # 2. Aggiungi l'immagine alla slide (inizialmente con dimensioni qualsiasi)
                 pic = slide.shapes.add_picture(str(img_path), left=side_margin, top=top_margin)
-                scale = min(avail_w / pic.image.width, avail_h / pic.image.height)
-                pic.width, pic.height = int(pic.image.width * scale), int(pic.image.height * scale)
+
+                # 3. Calcola la scala usando le dimensioni ottenute da Pillow
+                scale = min(avail_w / img_w, avail_h / img_h)
+
+                # 4. Applica le nuove dimensioni e posizione alla forma sulla slide
+                pic.width, pic.height = int(img_w * scale), int(img_h * scale)
                 pic.left, pic.top = int((slide_w - pic.width) / 2), top_margin
+                # --- FINE CODICE CORRETTO E ROBUSTO ---
 
                 tx_box = slide.shapes.add_textbox(0, slide_h - bottom_band_h, slide_w, bottom_band_h)
                 tf = tx_box.text_frame
@@ -787,10 +809,23 @@ def _build_leaderboard_ppt(ppt_path: Path, ranked_entries: list[tuple[int, str, 
             # Slide con immagine
             img_slide = prs.slides.add_slide(blank_layout)
             try:
+                # --- INIZIO CODICE CORRETTO E ROBUSTO ---
+                if Image is None:
+                    raise ImportError("La libreria Pillow non è installata, impossibile continuare.")
+
+                # 1. Apri l'immagine con Pillow per ottenere le dimensioni REALI
+                img_w, img_h = Image.open(img_path).size
+
+                # 2. Aggiungi l'immagine alla slide
                 pic = img_slide.shapes.add_picture(str(img_path), 0, 0)
-                scale = min(slide_w / pic.image.width, slide_h / pic.image.height)
-                pic.width, pic.height = int(pic.image.width * scale), int(pic.image.height * scale)
+
+                # 3. Calcola la scala usando le dimensioni ottenute da Pillow
+                scale = min(slide_w / img_w, slide_h / img_h)
+
+                # 4. Applica le nuove dimensioni e la posizione
+                pic.width, pic.height = int(img_w * scale), int(img_h * scale)
                 pic.left, pic.top = int((slide_w - pic.width) / 2), int((slide_h - pic.height) / 2)
+                # --- FINE CODICE CORRETTO E ROBUSTO ---
             except Exception as e:
                 print(f"ERRORE: Impossibile aggiungere l'immagine '{img_path.name}': {e}")
         prs.save(str(ppt_path))
@@ -851,10 +886,11 @@ def _generate_leaderboard_logic(base: Path, master_csv: Path) -> None:
 
     scored.sort(key=lambda x: (-x[2], x[0]))
     out_rows = [["Posizione", "Titolo"] + criteria + ["Media Totale"]]
-    rank, last_score, counter = 0, float('inf'), 0
+    rank, last_score = 0, float('inf')
     for title, cells, total in scored:
-        counter += 1
-        if total < last_score: rank, last_score = counter, total
+        if total < last_score:
+            rank += 1
+            last_score = total
         rank_str = str(rank) if total >= 0 else "N/D"
         out_rows.append([rank_str, title] + cells + [f"{total:.2f}" if total >= 0 else "N/D"])
 
@@ -986,6 +1022,8 @@ if __name__ == "__main__":
         print("AVVISO: `python-pptx` non installato, le funzioni di presentazione sono disabilitate.")
     if inquirer is None:
         print("AVVISO: `inquirer` non installato, verrà usata un'interfaccia a menu numerico.")
+    if Image is None:
+        print("AVVISO: `Pillow` non installato, le funzioni di generazione PPTX non funzioneranno.")
 
     try:
         main()
