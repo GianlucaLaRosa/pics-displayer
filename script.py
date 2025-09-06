@@ -11,7 +11,7 @@ import json
 import zipfile
 import webbrowser  # Aggiunto per aprire la documentazione
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 # --- Gestione codifica su Windows ---
 if sys.platform == 'win32':
@@ -398,7 +398,25 @@ def _action_generate_kit(base: Path, folder_name: str):
             print("Operazione annullata.")
             return
 
-    current_titles = sorted([_parse_filename(p)[1] for p in photo_paths])
+    # <<< CONTROLLO DUPLICATI >>>
+    parsed_titles = [_parse_filename(p)[1] for p in photo_paths]
+    title_counts = Counter(parsed_titles)
+    duplicates = [title for title, count in title_counts.items() if count > 1]
+
+    if duplicates:
+        print("\n" + "---" * 15)
+        print("❌ ERRORE CRITICO: Trovati titoli di foto duplicati!")
+        print("   La generazione del kit è bloccata perché più file producono lo stesso titolo dopo il parsing.")
+        print("\n   Titoli duplicati rilevati:")
+        for title in duplicates:
+            print(f"     - \"{title}\"")
+        print("\n   SOLUZIONE: Rinomina i file originali nella cartella 'pictures' per garantire che ogni foto")
+        print("   abbia un titolo unico e riprova.")
+        print("---" * 15)
+        _input_or_exit("\nPremi Invio per tornare al menu...")
+        return
+
+    current_titles = sorted(parsed_titles)  # Riusiamo la lista già calcolata
     old_titles = _read_existing_titles(csv_path)
 
     if sorted(current_titles) == sorted(old_titles):
@@ -934,7 +952,11 @@ def main() -> None:
     print("   Benvenuto nello strumento di gestione concorsi fotografici!   ")
     print("---" * 15)
 
-    root_dir = Path.cwd() / "Concorsi Orizzonti Fotografici"
+    if getattr(sys, 'frozen', False):
+        base_path = Path(sys.executable).parent
+    else:
+        base_path = Path(__file__).resolve().parent
+    root_dir = base_path / "Concorsi Orizzonti Fotografici"
     root_dir.mkdir(exist_ok=True)
 
     while True:
@@ -1003,7 +1025,7 @@ def main() -> None:
             elif chosen_key == "help":
                 print("\n🌐 Apertura della documentazione online nel browser...")
                 try:
-                    webbrowser.open("https://github.com/GianlucaLaRosa/pics-displayer/blob/master/README.md")
+                    webbrowser.open("https://github.com/FraMazu/orizzonti_fotografici/blob/master/README.md")
                 except Exception as e:
                     print(f"❌ Impossibile aprire il browser. Dettagli: {e}")
                 _input_or_exit("Premi Invio per continuare...")
