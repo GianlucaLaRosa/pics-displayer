@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-#!/usr/bin/env python3
+# !/usr/bin/env python3
 import datetime
 import csv
 import sys
@@ -446,12 +446,13 @@ def _action_generate_kit(base: Path, folder_name: str):
     if photo_paths:
         ppt_path = jury_kit_dir / f"{_make_snake(folder_name)}.pptx"
         parsed_photos = {_parse_filename(p)[1]: p for p in photo_paths}
-        ordered_pairs = [(t, parsed_photos[t]) for t in titles_for_csv if t in parsed_photos]
 
-        _build_ppt(ppt_path, ordered_pairs)
+        text_path_pairs = [(t, parsed_photos[t]) for t in titles_for_csv if t in parsed_photos]
+
+        _build_generic_photo_ppt(ppt_path, text_path_pairs)  # MODIFICATO: Chiama la funzione rinominata
         print(f"✅ Presentazione '{ppt_path.name}' aggiornata.")
 
-        _update_original_pictures_folder(jury_kit_dir, ordered_pairs)
+        _update_original_pictures_folder(jury_kit_dir, text_path_pairs)  # MODIFICATO: Passa la stessa struttura dati
         print(f"✅ Cartella 'original_pictures' aggiornata.")
 
     archive_base_path = base / f"{_make_snake(folder_name)}_jury_kit"
@@ -720,12 +721,14 @@ def _select_or_create_contest(root_dir: Path) -> tuple[Path, str] | None:
         return root_dir / chosen_name, chosen_name
 
 
-def _update_original_pictures_folder(jury_kit_dir: Path, title_path_pairs: list[tuple[str, Path]]):
+def _update_original_pictures_folder(jury_kit_dir: Path, text_path_pairs: list[tuple[str, Path]]):
     original_pictures_dir = jury_kit_dir / "original_pictures"
     try:
         if original_pictures_dir.exists(): shutil.rmtree(original_pictures_dir)
         original_pictures_dir.mkdir(exist_ok=True)
-        for title, original_path in title_path_pairs:
+        for _, original_path in text_path_pairs:
+            # Ricava il titolo dal nome del file per un salvataggio consistente
+            _, title = _parse_filename(original_path)
             safe_title = _sanitize_name(title)
             new_filename = f"{safe_title}{original_path.suffix}"
             shutil.copy(original_path, original_pictures_dir / new_filename)
@@ -748,46 +751,44 @@ def _create_jury_kit_zip(jury_kit_dir: Path, archive_base_name: Path):
 
 
 # --- LOGICA DI GENERAZIONE (PPT E CLASSIFICA) ---
-def _build_ppt(ppt_path: Path, title_path_pairs: list[tuple[str, Path]]) -> None:
+
+def _add_photo_slide(prs: Presentation, img_path: Path, text_content: str):
+    """Aggiunge una slide con foto e testo a una presentazione esistente."""
+    slide_w, slide_h = prs.slide_width, prs.slide_height
+    blank_layout = prs.slide_layouts[6]
+    bottom_band_h, top_margin, side_margin = Inches(0.4), Inches(0.1), Inches(0.1)
+    avail_w, avail_h = slide_w - 2 * side_margin, slide_h - bottom_band_h - top_margin
+
+    slide = prs.slides.add_slide(blank_layout)
+    try:
+        if Image is None:
+            raise ImportError("La libreria Pillow non è installata, impossibile continuare.")
+
+        img_w, img_h = Image.open(img_path).size
+        pic = slide.shapes.add_picture(str(img_path), left=side_margin, top=top_margin)
+        scale = min(avail_w / img_w, avail_h / img_h)
+        pic.width, pic.height = int(img_w * scale), int(img_h * scale)
+        pic.left, pic.top = int((slide_w - pic.width) / 2), top_margin
+
+        tx_box = slide.shapes.add_textbox(0, slide_h - bottom_band_h, slide_w, bottom_band_h)
+        tf = tx_box.text_frame
+        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+        p = tf.paragraphs[0]
+        p.alignment = PP_ALIGN.CENTER
+        run = p.add_run()
+        run.text = text_content
+        run.font.size, run.font.bold = Pt(22), True
+    except Exception as e:
+        print(f"ERRORE: Impossibile aggiungere l'immagine '{img_path.name}': {e}")
+
+
+# MODIFICATO: Rinominata e resa più generica per usare la nuova funzione helper.
+def _build_generic_photo_ppt(ppt_path: Path, text_path_pairs: list[tuple[str, Path]]) -> None:
     if Presentation is None: return
     try:
         prs = Presentation()
-        slide_w, slide_h = prs.slide_width, prs.slide_height
-        blank_layout = prs.slide_layouts[6]
-        bottom_band_h, top_margin, side_margin = Inches(0.4), Inches(0.1), Inches(0.1)
-        avail_w, avail_h = slide_w - 2 * side_margin, slide_h - bottom_band_h - top_margin
-
-        for title, img_path in title_path_pairs:
-            slide = prs.slides.add_slide(blank_layout)
-            try:
-                # --- INIZIO CODICE CORRETTO E ROBUSTO ---
-                if Image is None:
-                    raise ImportError("La libreria Pillow non è installata, impossibile continuare.")
-
-                # 1. Apri l'immagine con Pillow per ottenere le dimensioni REALI
-                img_w, img_h = Image.open(img_path).size
-
-                # 2. Aggiungi l'immagine alla slide (inizialmente con dimensioni qualsiasi)
-                pic = slide.shapes.add_picture(str(img_path), left=side_margin, top=top_margin)
-
-                # 3. Calcola la scala usando le dimensioni ottenute da Pillow
-                scale = min(avail_w / img_w, avail_h / img_h)
-
-                # 4. Applica le nuove dimensioni e posizione alla forma sulla slide
-                pic.width, pic.height = int(img_w * scale), int(img_h * scale)
-                pic.left, pic.top = int((slide_w - pic.width) / 2), top_margin
-                # --- FINE CODICE CORRETTO E ROBUSTO ---
-
-                tx_box = slide.shapes.add_textbox(0, slide_h - bottom_band_h, slide_w, bottom_band_h)
-                tf = tx_box.text_frame
-                tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-                p = tf.paragraphs[0]
-                p.alignment = PP_ALIGN.CENTER
-                run = p.add_run()
-                run.text = title
-                run.font.size, run.font.bold = Pt(22), True
-            except Exception as e:
-                print(f"ERRORE: Impossibile aggiungere l'immagine '{img_path.name}': {e}")
+        for text, img_path in text_path_pairs:
+            _add_photo_slide(prs, img_path, text)
         prs.save(str(ppt_path))
     except Exception as e:
         print(f"\n❌ ERRORE CRITICO durante la creazione della presentazione '{ppt_path.name}': {e}")
@@ -828,23 +829,13 @@ def _build_leaderboard_ppt(ppt_path: Path, ranked_entries: list[tuple[int, str, 
             # Slide con immagine
             img_slide = prs.slides.add_slide(blank_layout)
             try:
-                # --- INIZIO CODICE CORRETTO E ROBUSTO ---
                 if Image is None:
                     raise ImportError("La libreria Pillow non è installata, impossibile continuare.")
-
-                # 1. Apri l'immagine con Pillow per ottenere le dimensioni REALI
                 img_w, img_h = Image.open(img_path).size
-
-                # 2. Aggiungi l'immagine alla slide
                 pic = img_slide.shapes.add_picture(str(img_path), 0, 0)
-
-                # 3. Calcola la scala usando le dimensioni ottenute da Pillow
                 scale = min(slide_w / img_w, slide_h / img_h)
-
-                # 4. Applica le nuove dimensioni e la posizione
                 pic.width, pic.height = int(img_w * scale), int(img_h * scale)
                 pic.left, pic.top = int((slide_w - pic.width) / 2), int((slide_h - pic.height) / 2)
-                # --- FINE CODICE CORRETTO E ROBUSTO ---
             except Exception as e:
                 print(f"ERRORE: Impossibile aggiungere l'immagine '{img_path.name}': {e}")
         prs.save(str(ppt_path))
@@ -924,7 +915,7 @@ def _generate_leaderboard_logic(base: Path, master_csv: Path) -> None:
 
     all_ranks = sorted(list(set(int(row[0]) for row in out_rows[1:] if row[0].isdigit())))
     if not all_ranks:
-        print("ℹ️ Nessun classificato valido. Salto creazione presentazione.");
+        print("ℹ️ Nessun classificato valido. Salto creazione presentazioni aggiuntive.");
         return
 
     rank_cutoff = all_ranks[min(9, len(all_ranks) - 1)]
@@ -938,12 +929,71 @@ def _generate_leaderboard_logic(base: Path, master_csv: Path) -> None:
                 print(f"⚠️  AVVISO: Foto '{s_title}' non trovata per la presentazione.")
 
     if ppt_entries:
-        ppt_entries.reverse()
+        ppt_entries_reversed = sorted(ppt_entries, key=lambda x: x[0], reverse=True)
         ppt_path = leaderboard_dir / "classifica.pptx"
-        if _build_leaderboard_ppt(ppt_path, ppt_entries):
+        if _build_leaderboard_ppt(ppt_path, ppt_entries_reversed):
             print(f"✅ Presentazione classifica salvata in: {ppt_path.name}")
     else:
         print("ℹ️ Nessuna foto trovata per i primi classificati. Salto presentazione.")
+
+    # --- Generazione presentazioni `ordered.pptx` e `random.pptx` ---
+
+    # 1. Genera `ordered.pptx`
+    all_photos_with_author = []
+    for title, path in title_path_map.items():
+        author, _ = _parse_filename(path)
+        all_photos_with_author.append((author, title, path))
+
+    all_photos_with_author.sort(key=lambda x: x[0].lower())  # Ordina per autore
+
+    ordered_ppt_data = [(f"{author} - {title}", path) for author, title, path in all_photos_with_author]
+    ordered_ppt_path = leaderboard_dir / "ordered.pptx"
+    _build_generic_photo_ppt(ordered_ppt_path, ordered_ppt_data)
+    print(f"✅ Presentazione ordinata per autore salvata in: {ordered_ppt_path.name}")
+
+    # 2. Genera `random.pptx`
+    top_titles = {entry[1] for entry in ppt_entries}
+    top_photos = []
+    other_photos = []
+
+    for title, path in title_path_map.items():
+        if title in top_titles:
+            top_photos.append((title, path))
+        else:
+            other_photos.append((title, path))
+
+    random.shuffle(top_photos)
+    random.shuffle(other_photos)
+
+    random_ppt_path = leaderboard_dir / "random.pptx"
+    try:
+        prs_random = Presentation()
+        # Aggiungi le foto non in top 10
+        for title, path in other_photos:
+            _add_photo_slide(prs_random, path, title)
+
+        # Aggiungi slide intermedia se ci sono foto in entrambe le categorie
+        if top_photos and other_photos:
+            interstitial_slide = prs_random.slides.add_slide(prs_random.slide_layouts[6])  # Layout vuoto
+            tx_box = interstitial_slide.shapes.add_textbox(Inches(1), Inches(1), prs_random.slide_width - Inches(2),
+                                                           prs_random.slide_height - Inches(2))
+            tf = tx_box.text_frame
+            tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+            p = tf.paragraphs[0]
+            p.alignment = PP_ALIGN.CENTER
+            run = p.add_run()
+            run.text = f"Le prime {rank_cutoff} sono:"
+            run.font.size, run.font.bold = Pt(44), True
+
+        # Aggiungi le foto in top 10
+        for title, path in top_photos:
+            _add_photo_slide(prs_random, path, title)
+
+        prs_random.save(str(random_ppt_path))
+        print(f"✅ Presentazione randomizzata salvata in: {random_ppt_path.name}")
+
+    except Exception as e:
+        print(f"❌ ERRORE durante la creazione di '{random_ppt_path.name}': {e}")
 
 
 # --- FUNZIONE MAIN ---
